@@ -1,13 +1,11 @@
 # New-DT: Token-Owned Scalar-Pool Dynamic Transformer
 
 New-DT is a research reference implementation of a Transformer-shaped model in
-which **every vocabulary token owns routes into separate scalar-neuron pools**.
-Tokens may share individual scalars. Adam updates each unique scalar once using
-the sum of every gradient contribution that reached it.
+which every vocabulary token owns routes into separate scalar-neuron pools.
+Tokens may reuse the same scalar from **any position** inside a vector or matrix.
+Adam updates each unique scalar once using the combined gradient that reached it.
 
-This repository implements the architecture discussed for the new DT branch. It
-is deliberately explicit and small-scale: the goal is to make ownership,
-sharing, Adam behavior, split, and merge inspectable before optimizing kernels.
+The current goal is correctness and inspectability before custom sparse kernels.
 
 ## Architecture
 
@@ -15,19 +13,17 @@ sharing, Adam behavior, split, and merge inspectable before optimizing kernels.
 Input token IDs
     │
     ├── token-owned routes → Embedding scalar pool
-    │
     ▼
-Shared residual stream + fixed positional encoding
+Shared residual stream + positional encoding
     │
     ├── Shared RMSNorm
-    ├── token-owned Q/K/V/O routes → Attention scalar pools
+    ├── token-owned Q/K/V/O routes → separate attention pools
     ├── shared causal mask + softmax
     └── shared residual addition
     │
     ├── Shared RMSNorm
-    ├── token-owned Up/Gate/Down routes → FFN scalar pools
+    ├── token-owned Up/Gate/Down routes → separate FFN pools
     └── shared residual addition
-    │
     ▼
 Shared final RMSNorm
     │
@@ -36,86 +32,115 @@ Shared final RMSNorm
       logits
 ```
 
-### Pool separation
+Pool storage never overlaps across embedding, Q, K, V, O, FFN projections, or
+LM output. Residuals, normalization, masking, softmax, positional encoding, and
+topology remain common so all tokens communicate in one representation space.
 
-There are four conceptual families, and their storage never overlaps:
+## Global scalar sharing inside a pool
 
-1. **Embedding pool**
-2. **Attention family** — separate Q, K, V, and O pools for every layer
-3. **FFN family** — separate Up, Gate, and Down pools for every layer
-4. **LM pool** — owned by candidate output tokens
-
-The implementation uses an even stricter boundary than one pool per family:
-each layer/projection has its own `ScalarPool`, preventing accidental merges
-between unrelated operations.
-
-### What stays common
-
-These components are shared because they are communication or stabilization,
-not token-owned knowledge capacity:
-
-- residual stream and residual addition;
-- RMSNorm parameters;
-- fixed positional encoding;
-- causal mask and attention softmax;
-- layer dimensions and topology.
-
-## Scalar sharing example
-
-With four route slots and `initial_shared_fraction=0.5`:
+A scalar is not tied to one vector coordinate:
 
 ```text
-Token A → [0, 1, 2, 3]
-Token B → [0, 1, 4, 5]
+scalar 75
+├── Token A, route slot 3
+├── Token B, route slot 41
+└── Token C, route slot 92
 ```
 
-Both tokens have four scalar neurons, share two, and together use six unique
-scalars. When both appear, autograd adds their contributions to scalars `0` and
-`1`; Adam updates six unique scalars rather than eight token occurrences.
+If their route gradients are:
 
-## Adam and delayed structure changes
+```text
+A/3  → +0.40
+B/41 → +0.30
+C/92 → -0.50
+```
 
-The intended training order is:
+Autograd gives Adam one pool gradient:
+
+```text
+gradient[75] = +0.20
+```
+
+New-DT also retains the three exact route contributions. Persistent conflict can
+therefore split only `C/92`:
+
+```text
+A/3  → 75
+B/41 → 75
+C/92 → 75'
+```
+
+## Forward and reverse routing indexes
+
+Every routed tensor maintains both directions:
+
+```text
+(token, route slot) → scalar
+scalar → all (token, route slot) locations
+```
+
+The reverse index also maintains each scalar's total usage count. Split and merge
+operations no longer search the full route table.
+
+- `reroute_slot(...)` changes one exact route cell.
+- `replace_scalar_everywhere(...)` visits only locations already indexed for the
+  source scalar.
+- The reverse index is rebuilt automatically after checkpoint loading.
+
+## Adam and gradient accumulation
+
+Recommended order:
 
 ```text
 micro-batch forward/backward
-collect owner-specific route evidence
-repeat until gradient accumulation completes
+capture route-slot gradient evidence
+repeat until accumulation completes
 Adam step
-periodic split/merge analysis
+periodic affected-neuron split/merge pass
 zero gradients
 ```
 
-Adam remains ordinary Adam/AdamW. It stores one first moment and one second
-moment for each scalar-pool entry. Routes—not Adam—decide where gradients go.
+Adam stores one first moment and second moment for each scalar-pool entry. Routes,
+not Adam, determine where gradients go. A split copies the source value and its
+Adam moments into a preallocated free slot.
 
-Pools are preallocated. A split therefore activates a free scalar slot rather
-than replacing the PyTorch `Parameter`, preserving optimizer tensor shapes.
-The new slot copies the source weight and, by default, its Adam moments.
+For incremental merge indexing, use `torch.optim.Adam`, or AdamW with
+`weight_decay=0`. Nonzero global/decoupled weight decay changes untouched entries
+inside the whole pool tensor and invalidates an affected-only value index.
 
-## Split and merge
+## Split threshold
 
-`DynamicStructureController` captures gradients on the materialized route tensor
-before PyTorch sums them into a shared scalar. This preserves evidence such as:
-
-```text
-Token A → scalar 75 → positive gradient history
-Token B → scalar 75 → negative gradient history
-```
-
-At a structural interval, persistent opposing owner gradients can trigger:
+Conflict evidence is stored by:
 
 ```text
-Before: A → 75, B → 75
-After:  A → 75', B → 75
+(pool, token ID, exact route slot, scalar ID)
 ```
 
-Merge is conservative and local to one routed tensor. Two scalars are eligible
-only when their values and gradient histories are close and their owner sets do
-not overlap.
+Only scalars affected since the previous structural pass are analyzed. A scalar
+used in many places receives a higher effective split threshold:
 
-A forced final structural pass can be run at the end of training, so evidence
-from a partial last interval is not discarded.
+```text
+threshold = base_threshold
+          + owner_threshold_scale × log2(max(1, owner_count / 2))
+```
+
+The threshold is capped by `max_conflict_threshold`. This makes heavily shared
+neurons harder—but not impossible—to split.
+
+## Incremental merge
+
+The controller maintains scalar-value buckets per pool. After Adam, only affected
+or still-momentum-active scalars refresh their bucket membership.
+
+An affected scalar is compared only with nearby buckets, then merged only when:
+
+- scalar values are within `merge_weight_tolerance`;
+- gradient histories are within `merge_gradient_tolerance`;
+- both have enough gradient samples.
+
+The less-used scalar is redirected into the more-used scalar, minimizing route
+map writes. Scalars created by a split are protected from immediate re-merging in
+the same structural pass.
 
 ## Install and test
 
@@ -126,7 +151,17 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Run the synthetic next-token demo:
+The tests cover:
+
+- forward/backward and Adam;
+- strict pool separation and shared RMSNorm;
+- one scalar reused at different route slots;
+- exact-slot splitting and Adam-state copying;
+- opposing route gradients that cancel in the pool gradient;
+- conflict-based controller splitting;
+- affected-neighborhood merging through the reverse map.
+
+Run the synthetic demo:
 
 ```bash
 python train_demo.py --steps 20 --grad-accum 2
@@ -136,7 +171,11 @@ python train_demo.py --steps 20 --grad-accum 2
 
 ```python
 import torch
-from new_dt import DynamicTransformer, DynamicTransformerConfig
+from new_dt import (
+    DynamicStructureController,
+    DynamicTransformer,
+    DynamicTransformerConfig,
+)
 
 config = DynamicTransformerConfig(
     vocab_size=32,
@@ -147,28 +186,21 @@ config = DynamicTransformerConfig(
     initial_shared_fraction=0.5,
 )
 model = DynamicTransformer(config)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+controller = DynamicStructureController(structure_interval=100)
 
 input_ids = torch.randint(0, config.vocab_size, (2, 12))
-output = model(input_ids, labels=input_ids)
+output = model(input_ids, labels=input_ids, collect_route_grads=True)
 output.loss.backward()
+controller.collect(model)
 optimizer.step()
+controller.maybe_restructure(model, optimizer, optimizer_step=1)
+optimizer.zero_grad(set_to_none=True)
 ```
 
-## Important limitation
+## Current limitation
 
-A token-specific full matrix contains many scalar routes. This reference model
-therefore scales poorly in route-table memory and gathered tensors. That is not
-hidden: it is the central engineering problem of strict scalar DT.
-
-The next performance branch should preserve scalar ownership while testing:
-
-- packed and deduplicated route tables;
-- sparse gather/scatter kernels;
-- route caching during inference;
-- limited token-owned matrices or structured low-rank assembly;
-- bounded pool growth and free-slot recycling;
-- parameter-matched comparisons with dense Transformer, LoRA, and MOD.
-
-The current repository establishes a correct, testable baseline before those
-optimizations change the semantics.
+A token-specific full matrix contains many scalar routes, so route-table memory
+and gathered tensors still scale poorly. The next performance work should focus
+on packed route storage, sparse gather/scatter kernels, inference route caching,
+and bounded pool growth without changing exact scalar ownership semantics.
