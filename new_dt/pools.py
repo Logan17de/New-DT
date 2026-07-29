@@ -8,11 +8,20 @@ import torch
 from torch import Tensor, nn
 
 
+@dataclass(frozen=True, order=True, slots=True)
+class RouteLocation:
+    """One exact route cell owned by a token inside a routed parameter tensor."""
+
+    token_id: int
+    route_slot: int
+
+
 @dataclass(frozen=True, slots=True)
 class RouteGradientSample:
-    """Per-owner gradients captured before they are summed into a shared scalar."""
+    """Per-route gradients captured before sharing sums them into pool scalars."""
 
     token_ids: Tensor
+    route_slots: Tensor
     scalar_ids: Tensor
     gradients: Tensor
 
@@ -20,9 +29,8 @@ class RouteGradientSample:
 class ScalarPool(nn.Module):
     """A preallocated, independently trainable pool of scalar parameters.
 
-    Routes point to entries in ``values``. Multiple tokens may point to the same
-    entry, so autograd naturally sums their gradients and Adam updates that
-    unique scalar exactly once.
+    Routes may point to the same entry from any token and any vector/matrix slot.
+    Autograd sums those contributions and Adam updates the unique scalar once.
     """
 
     def __init__(
@@ -103,11 +111,16 @@ class ScalarPool(nn.Module):
 
 
 class RoutedParameterTensor(nn.Module):
-    """Token-owned parameter tensors assembled from shared scalar pool entries.
+    """Token-owned tensors assembled from globally reusable pool scalars.
 
-    For a token-specific matrix with shape ``[out_features, in_features]``, every
-    matrix element is an independent route slot pointing to one scalar. This is
-    intentionally a clear reference implementation rather than a fast kernel.
+    A scalar may be reused at any route slot, not only the matching coordinate in
+    another token vector. Two synchronized indexes are maintained:
+
+    * ``route_ids[token, slot] -> scalar`` (forward routing)
+    * ``scalar -> {packed token/slot locations}`` (reverse ownership)
+
+    Split and merge therefore update only known route cells instead of scanning
+    the complete route table.
     """
 
     def __init__(
@@ -150,14 +163,58 @@ class RoutedParameterTensor(nn.Module):
             name=name,
         )
         self.register_buffer("route_ids", route.view(vocab_size, *parameter_shape))
+        self.register_buffer(
+            "route_use_count",
+            torch.zeros(capacity, dtype=torch.long),
+            persistent=False,
+        )
+        self._scalar_to_packed_slots: dict[int, set[int]] = {}
         self._route_grad_cache: list[tuple[Tensor, Tensor, Tensor]] = []
+        self.rebuild_route_index()
+
+    def _pack(self, token_id: int, route_slot: int) -> int:
+        return token_id * self.route_size + route_slot
+
+    def _unpack(self, packed: int) -> RouteLocation:
+        return RouteLocation(
+            token_id=packed // self.route_size,
+            route_slot=packed % self.route_size,
+        )
+
+    @torch.no_grad()
+    def rebuild_route_index(self) -> None:
+        """Rebuild reverse ownership once after initialization or checkpoint load."""
+
+        flat = self.route_ids.detach().view(self.vocab_size, self.route_size).cpu()
+        reverse: dict[int, set[int]] = {}
+        for token_id, scalar_row in enumerate(flat.tolist()):
+            for route_slot, scalar_id in enumerate(scalar_row):
+                reverse.setdefault(int(scalar_id), set()).add(
+                    self._pack(token_id, route_slot)
+                )
+        self._scalar_to_packed_slots = reverse
+
+        counts = torch.zeros(
+            self.pool.capacity,
+            dtype=torch.long,
+            device=self.route_use_count.device,
+        )
+        for scalar_id, locations in reverse.items():
+            counts[scalar_id] = len(locations)
+        self.route_use_count.copy_(counts)
+
+    def _load_from_state_dict(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+        super()._load_from_state_dict(*args, **kwargs)
+        self.rebuild_route_index()
 
     def forward(self, token_ids: Tensor, *, collect_route_grads: bool = False) -> Tensor:
         scalar_ids = self.route_ids[token_ids]
         materialized = self.pool.values[scalar_ids]
         if collect_route_grads and torch.is_grad_enabled():
             materialized.retain_grad()
-            self._route_grad_cache.append((token_ids.detach(), scalar_ids.detach(), materialized))
+            self._route_grad_cache.append(
+                (token_ids.detach(), scalar_ids.detach(), materialized)
+            )
         return materialized
 
     def materialize_all(self, *, collect_route_grads: bool = False) -> Tensor:
@@ -165,38 +222,103 @@ class RoutedParameterTensor(nn.Module):
         return self.forward(token_ids, collect_route_grads=collect_route_grads)
 
     def pop_route_gradient_samples(self) -> Iterator[RouteGradientSample]:
-        """Return gradients per token owner before shared-pool scatter addition."""
+        """Return exact token/slot gradients before shared-pool scatter addition."""
 
         cache, self._route_grad_cache = self._route_grad_cache, []
         for token_ids, scalar_ids, materialized in cache:
             if materialized.grad is None:
                 continue
-            route_size = self.route_size
+            rows = int(token_ids.numel())
+            route_slots = torch.arange(self.route_size).expand(rows, -1)
             yield RouteGradientSample(
                 token_ids=token_ids.reshape(-1).cpu(),
-                scalar_ids=scalar_ids.reshape(-1, route_size).cpu(),
-                gradients=materialized.grad.detach().reshape(-1, route_size).cpu(),
+                route_slots=route_slots,
+                scalar_ids=scalar_ids.reshape(-1, self.route_size).cpu(),
+                gradients=materialized.grad.detach()
+                .reshape(-1, self.route_size)
+                .cpu(),
             )
 
+    def scalar_at(self, location: RouteLocation) -> int:
+        flat = self.route_ids.view(self.vocab_size, self.route_size)
+        return int(flat[location.token_id, location.route_slot].item())
+
     @torch.no_grad()
-    def reroute_token_scalar(self, token_id: int, old_index: int, new_index: int) -> int:
-        token_route = self.route_ids[token_id]
-        mask = token_route == old_index
-        count = int(mask.sum().item())
-        token_route[mask] = new_index
-        return count
+    def reroute_slot(
+        self,
+        token_id: int,
+        route_slot: int,
+        new_index: int,
+        *,
+        expected_old_index: int | None = None,
+    ) -> bool:
+        """Move exactly one route cell and update both ownership indexes."""
+
+        if not 0 <= token_id < self.vocab_size:
+            raise IndexError("token_id outside vocabulary")
+        if not 0 <= route_slot < self.route_size:
+            raise IndexError("route_slot outside parameter tensor")
+        if not bool(self.pool.active_mask[new_index]):
+            raise ValueError(f"Cannot route to inactive scalar {new_index}")
+
+        flat = self.route_ids.view(self.vocab_size, self.route_size)
+        old_index = int(flat[token_id, route_slot].item())
+        if expected_old_index is not None and old_index != expected_old_index:
+            return False
+        if old_index == new_index:
+            return False
+
+        packed = self._pack(token_id, route_slot)
+        old_locations = self._scalar_to_packed_slots.get(old_index)
+        if old_locations is None or packed not in old_locations:
+            raise RuntimeError("reverse route index is inconsistent")
+
+        flat[token_id, route_slot] = new_index
+        old_locations.remove(packed)
+        if not old_locations:
+            self._scalar_to_packed_slots.pop(old_index, None)
+        self._scalar_to_packed_slots.setdefault(new_index, set()).add(packed)
+        self.route_use_count[old_index] -= 1
+        self.route_use_count[new_index] += 1
+        return True
 
     @torch.no_grad()
     def replace_scalar_everywhere(self, old_index: int, new_index: int) -> int:
-        mask = self.route_ids == old_index
-        count = int(mask.sum().item())
-        self.route_ids[mask] = new_index
-        return count
+        """Redirect only locations in the reverse map; never scan all routes."""
 
-    def owners(self, scalar_index: int) -> set[int]:
-        flat = self.route_ids.view(self.vocab_size, -1)
-        owner_ids = (flat == scalar_index).any(dim=1).nonzero(as_tuple=False).flatten()
-        return set(int(item) for item in owner_ids.tolist())
+        packed_locations = tuple(self._scalar_to_packed_slots.get(old_index, ()))
+        changed = 0
+        for packed in packed_locations:
+            location = self._unpack(packed)
+            if self.reroute_slot(
+                location.token_id,
+                location.route_slot,
+                new_index,
+                expected_old_index=old_index,
+            ):
+                changed += 1
+        return changed
+
+    def route_locations(self, scalar_index: int) -> tuple[RouteLocation, ...]:
+        return tuple(
+            sorted(
+                self._unpack(packed)
+                for packed in self._scalar_to_packed_slots.get(scalar_index, ())
+            )
+        )
+
+    def owner_tokens(self, scalar_index: int) -> set[int]:
+        return {item.token_id for item in self.route_locations(scalar_index)}
+
+    def usage_count(self, scalar_index: int) -> int:
+        return int(self.route_use_count[scalar_index].item())
+
+    def iter_used_scalar_indices(self) -> Iterator[int]:
+        yield from self._scalar_to_packed_slots.keys()
 
     def used_scalar_indices(self) -> Tensor:
-        return torch.unique(self.route_ids)
+        return torch.tensor(
+            sorted(self._scalar_to_packed_slots),
+            dtype=torch.long,
+            device=self.route_ids.device,
+        )
