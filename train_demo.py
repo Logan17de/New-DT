@@ -4,11 +4,7 @@ import argparse
 
 import torch
 
-from new_dt import (
-    DynamicStructureController,
-    DynamicTransformer,
-    DynamicTransformerConfig,
-)
+from new_dt import DynamicStructureController, DynamicTransformer, DynamicTransformerConfig
 
 
 def make_batch(batch_size: int, seq_len: int, vocab_size: int, device: str) -> torch.Tensor:
@@ -38,14 +34,19 @@ def main() -> None:
         pool_growth_factor=1.25,
     )
     model = DynamicTransformer(config).to(args.device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+    # Incremental merge buckets assume untouched pool entries do not move.
+    # Use Adam, or AdamW with weight_decay=0.
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
     controller = DynamicStructureController(
         structure_interval=5,
         min_owner_samples=3,
         min_gradient_magnitude=1e-7,
         min_conflict_score=0.25,
+        owner_threshold_scale=0.03,
         max_splits_per_pass=2,
-        enable_merge=False,
+        enable_merge=True,
+        merge_weight_tolerance=1e-6,
+        merge_gradient_tolerance=1e-6,
     )
 
     optimizer.zero_grad(set_to_none=True)
@@ -53,18 +54,12 @@ def main() -> None:
         accumulated_loss = 0.0
         for _ in range(args.grad_accum):
             input_ids = make_batch(4, 12, config.vocab_size, args.device)
-            output = model(
-                input_ids,
-                labels=input_ids,
-                collect_route_grads=True,
-            )
+            output = model(input_ids, labels=input_ids, collect_route_grads=True)
             assert output.loss is not None
             (output.loss / args.grad_accum).backward()
             accumulated_loss += float(output.loss.detach())
-            # Records owner evidence but does not change parameters or routes.
             controller.collect(model)
 
-        # Adam updates each unique scalar once using accumulated gradients.
         optimizer.step()
         events = controller.maybe_restructure(
             model, optimizer, optimizer_step=optimizer_step
@@ -79,7 +74,6 @@ def main() -> None:
         for event in events:
             print("  ", event)
 
-    # Analyze a final partial structural interval before saving a checkpoint.
     final_events = controller.maybe_restructure(
         model, optimizer, optimizer_step=args.steps, force=True
     )
