@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -24,25 +23,12 @@ class DynamicTransformerOutput:
     loss: Tensor | None = None
 
 
-def _sinusoidal_positions(max_seq_len: int, dim: int) -> Tensor:
-    positions = torch.arange(max_seq_len, dtype=torch.float32).unsqueeze(1)
-    frequencies = torch.exp(
-        torch.arange(0, dim, 2, dtype=torch.float32)
-        * (-math.log(10_000.0) / max(dim, 1))
-    )
-    table = torch.zeros(max_seq_len, dim)
-    table[:, 0::2] = torch.sin(positions * frequencies)
-    if dim > 1:
-        table[:, 1::2] = torch.cos(positions * frequencies[: table[:, 1::2].shape[1]])
-    return table
-
-
 class DynamicTransformer(nn.Module):
-    """Reference implementation of a token-owned scalar-pool Transformer.
+    """Token-owned scalar-pool Transformer with SPRC routes and RoPE.
 
     Knowledge-bearing parameters are routed by token identity. Residual streams,
-    normalization, causal masking, softmax, positional encoding, and layer layout
-    remain common so tokens can communicate in one shared representation space.
+    normalization, causal masking, softmax, rotary position operations, and layer
+    layout remain common so tokens communicate in one shared representation space.
     """
 
     def __init__(self, config: DynamicTransformerConfig) -> None:
@@ -50,11 +36,6 @@ class DynamicTransformer(nn.Module):
         config.validate()
         self.config = config
         self.embedding = TokenRoutedEmbedding(config)
-        self.register_buffer(
-            "position_encoding",
-            _sinusoidal_positions(config.max_seq_len, config.d_model),
-            persistent=True,
-        )
         self.layers = nn.ModuleList(
             DynamicTransformerBlock(config, index)
             for index in range(config.n_layers)
@@ -76,10 +57,9 @@ class DynamicTransformer(nn.Module):
         if input_ids.min() < 0 or input_ids.max() >= self.config.vocab_size:
             raise ValueError("input_ids contain token IDs outside the vocabulary")
 
-        seq_len = input_ids.shape[1]
-        x = self.embedding(
-            input_ids, collect_route_grads=collect_route_grads
-        ) + self.position_encoding[:seq_len].to(input_ids.device)
+        # RoPE is applied to Q/K inside each attention layer. No additive
+        # positional table is stored or added to the embedding stream.
+        x = self.embedding(input_ids, collect_route_grads=collect_route_grads)
         for layer in self.layers:
             x = layer(x, input_ids, collect_route_grads=collect_route_grads)
         x = self.final_norm(x)
@@ -100,12 +80,22 @@ class DynamicTransformer(nn.Module):
             if isinstance(module, RoutedParameterTensor):
                 yield name, module
 
+    def compact_routes(self, *, force: bool = False) -> dict[str, dict[str, int]]:
+        return {
+            name: routed.compact_routes(force=force)
+            for name, routed in self.routed_tensors()
+        }
+
     def pool_summary(self) -> dict[str, dict[str, int]]:
         summary: dict[str, dict[str, int]] = {}
         for name, routed in self.routed_tensors():
+            storage = routed.routing_storage_estimate()
             summary[name] = {
                 "active": routed.pool.active_count,
                 "capacity": routed.pool.capacity,
                 "route_slots_per_token": routed.route_size,
+                "route_pages_per_token": routed.route_program.num_pages,
+                "estimated_route_bytes": storage["total_bytes"],
+                "neuron_id_bits": storage["neuron_id_bits"],
             }
         return summary
