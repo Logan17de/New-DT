@@ -7,6 +7,8 @@ from typing import Iterator
 import torch
 from torch import Tensor, nn
 
+from .routing import RoutePageRecipe, SelectivePageReconstructionStore
+
 
 @dataclass(frozen=True, order=True, slots=True)
 class RouteLocation:
@@ -27,11 +29,7 @@ class RouteGradientSample:
 
 
 class ScalarPool(nn.Module):
-    """A preallocated, independently trainable pool of scalar parameters.
-
-    Routes may point to the same entry from any token and any vector/matrix slot.
-    Autograd sums those contributions and Adam updates the unique scalar once.
-    """
+    """A preallocated, independently trainable pool of scalar parameters."""
 
     def __init__(
         self,
@@ -111,16 +109,15 @@ class ScalarPool(nn.Module):
 
 
 class RoutedParameterTensor(nn.Module):
-    """Token-owned tensors assembled from globally reusable pool scalars.
+    """Token-owned tensor reconstructed from immutable route pages.
 
-    A scalar may be reused at any route slot, not only the matching coordinate in
-    another token vector. Two synchronized indexes are maintained:
+    Persistent routes use Selective Page Reconstruction Compression (SPRC):
 
-    * ``route_ids[token, slot] -> scalar`` (forward routing)
-    * ``scalar -> {packed token/slot locations}`` (reverse ownership)
+    ``base template + optional shared delta + rare token exception``.
 
-    Split and merge therefore update only known route cells instead of scanning
-    the complete route table.
+    A split writes one exception. Repeated patches can become shared deltas, and a
+    large patch is absorbed into a new immutable template. Scalar sharing remains
+    slot-level and exact; pages are only storage and selective-decoding units.
     """
 
     def __init__(
@@ -132,6 +129,12 @@ class RoutedParameterTensor(nn.Module):
         growth_factor: float,
         init_std: float,
         name: str,
+        page_size: int = 1024,
+        templates_per_page: int = 2,
+        delta_promotion_threshold: int = 32,
+        template_promotion_threshold: int = 256,
+        template_promotion_fraction: float = 0.25,
+        shared_delta_min_reuse: int = 2,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -139,76 +142,42 @@ class RoutedParameterTensor(nn.Module):
         self.route_size = math.prod(parameter_shape)
         self.name = name
 
-        shared_count = int(round(self.route_size * shared_fraction))
-        shared_count = min(max(shared_count, 0), self.route_size)
-        private_count = self.route_size - shared_count
-        initial_active = shared_count + vocab_size * private_count
+        self.route_program = SelectivePageReconstructionStore(
+            vocab_size,
+            self.route_size,
+            page_size=page_size,
+            templates_per_page=templates_per_page,
+            shared_fraction=shared_fraction,
+            delta_promotion_threshold=delta_promotion_threshold,
+            template_promotion_threshold=template_promotion_threshold,
+            template_promotion_fraction=template_promotion_fraction,
+            shared_delta_min_reuse=shared_delta_min_reuse,
+        )
+        initial_active = self.route_program.required_pool_size
         capacity = max(initial_active + 8, int(math.ceil(initial_active * growth_factor)))
-
-        route = torch.empty(vocab_size, self.route_size, dtype=torch.long)
-        if shared_count:
-            route[:, :shared_count] = torch.arange(shared_count)
-        cursor = shared_count
-        for token_id in range(vocab_size):
-            if private_count:
-                route[token_id, shared_count:] = torch.arange(
-                    cursor, cursor + private_count
-                )
-                cursor += private_count
-
         self.pool = ScalarPool(
             capacity,
             initial_active,
             init_std=init_std,
             name=name,
         )
-        self.register_buffer("route_ids", route.view(vocab_size, *parameter_shape))
-        self.register_buffer(
-            "route_use_count",
-            torch.zeros(capacity, dtype=torch.long),
-            persistent=False,
-        )
-        self._scalar_to_packed_slots: dict[int, set[int]] = {}
         self._route_grad_cache: list[tuple[Tensor, Tensor, Tensor]] = []
-        self.rebuild_route_index()
 
-    def _pack(self, token_id: int, route_slot: int) -> int:
-        return token_id * self.route_size + route_slot
+    @property
+    def route_ids(self) -> Tensor:
+        """Compatibility/debug view. It materializes all routes on demand."""
 
-    def _unpack(self, packed: int) -> RouteLocation:
-        return RouteLocation(
-            token_id=packed // self.route_size,
-            route_slot=packed % self.route_size,
+        return self.route_program.materialize_all(device=self.pool.values.device).view(
+            self.vocab_size, *self.parameter_shape
         )
 
-    @torch.no_grad()
     def rebuild_route_index(self) -> None:
-        """Rebuild reverse ownership once after initialization or checkpoint load."""
-
-        flat = self.route_ids.detach().view(self.vocab_size, self.route_size).cpu()
-        reverse: dict[int, set[int]] = {}
-        for token_id, scalar_row in enumerate(flat.tolist()):
-            for route_slot, scalar_id in enumerate(scalar_row):
-                reverse.setdefault(int(scalar_id), set()).add(
-                    self._pack(token_id, route_slot)
-                )
-        self._scalar_to_packed_slots = reverse
-
-        counts = torch.zeros(
-            self.pool.capacity,
-            dtype=torch.long,
-            device=self.route_use_count.device,
-        )
-        for scalar_id, locations in reverse.items():
-            counts[scalar_id] = len(locations)
-        self.route_use_count.copy_(counts)
-
-    def _load_from_state_dict(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
-        super()._load_from_state_dict(*args, **kwargs)
-        self.rebuild_route_index()
+        self.route_program.rebuild_indexes()
 
     def forward(self, token_ids: Tensor, *, collect_route_grads: bool = False) -> Tensor:
-        scalar_ids = self.route_ids[token_ids]
+        scalar_ids = self.route_program.resolve(
+            token_ids, device=self.pool.values.device
+        ).view(*token_ids.shape, *self.parameter_shape)
         materialized = self.pool.values[scalar_ids]
         if collect_route_grads and torch.is_grad_enabled():
             materialized.retain_grad()
@@ -217,8 +186,18 @@ class RoutedParameterTensor(nn.Module):
             )
         return materialized
 
+    def resolve_page(self, token_id: int, page_id: int) -> Tensor:
+        """Resolve one logical route page without decoding the complete tensor."""
+
+        return self.route_program.resolve_page(
+            token_id, page_id, device=self.pool.values.device
+        )
+
+    def page_recipe(self, token_id: int, page_id: int) -> RoutePageRecipe:
+        return self.route_program.page_recipe(token_id, page_id)
+
     def materialize_all(self, *, collect_route_grads: bool = False) -> Tensor:
-        token_ids = torch.arange(self.vocab_size, device=self.route_ids.device)
+        token_ids = torch.arange(self.vocab_size, device=self.pool.values.device)
         return self.forward(token_ids, collect_route_grads=collect_route_grads)
 
     def pop_route_gradient_samples(self) -> Iterator[RouteGradientSample]:
@@ -240,8 +219,7 @@ class RoutedParameterTensor(nn.Module):
             )
 
     def scalar_at(self, location: RouteLocation) -> int:
-        flat = self.route_ids.view(self.vocab_size, self.route_size)
-        return int(flat[location.token_id, location.route_slot].item())
+        return self.route_program.scalar_at(location.token_id, location.route_slot)
 
     @torch.no_grad()
     def reroute_slot(
@@ -252,7 +230,7 @@ class RoutedParameterTensor(nn.Module):
         *,
         expected_old_index: int | None = None,
     ) -> bool:
-        """Move exactly one route cell and update both ownership indexes."""
+        """Move one exact route cell by creating/removing an SPRC exception."""
 
         if not 0 <= token_id < self.vocab_size:
             raise IndexError("token_id outside vocabulary")
@@ -260,65 +238,43 @@ class RoutedParameterTensor(nn.Module):
             raise IndexError("route_slot outside parameter tensor")
         if not bool(self.pool.active_mask[new_index]):
             raise ValueError(f"Cannot route to inactive scalar {new_index}")
-
-        flat = self.route_ids.view(self.vocab_size, self.route_size)
-        old_index = int(flat[token_id, route_slot].item())
-        if expected_old_index is not None and old_index != expected_old_index:
-            return False
-        if old_index == new_index:
-            return False
-
-        packed = self._pack(token_id, route_slot)
-        old_locations = self._scalar_to_packed_slots.get(old_index)
-        if old_locations is None or packed not in old_locations:
-            raise RuntimeError("reverse route index is inconsistent")
-
-        flat[token_id, route_slot] = new_index
-        old_locations.remove(packed)
-        if not old_locations:
-            self._scalar_to_packed_slots.pop(old_index, None)
-        self._scalar_to_packed_slots.setdefault(new_index, set()).add(packed)
-        self.route_use_count[old_index] -= 1
-        self.route_use_count[new_index] += 1
-        return True
+        return self.route_program.reroute_slot(
+            token_id,
+            route_slot,
+            new_index,
+            expected_old_scalar=expected_old_index,
+        )
 
     @torch.no_grad()
     def replace_scalar_everywhere(self, old_index: int, new_index: int) -> int:
-        """Redirect only locations in the reverse map; never scan all routes."""
+        """Redirect exact owners found from templates plus sparse deviations."""
 
-        packed_locations = tuple(self._scalar_to_packed_slots.get(old_index, ()))
-        changed = 0
-        for packed in packed_locations:
-            location = self._unpack(packed)
-            if self.reroute_slot(
-                location.token_id,
-                location.route_slot,
-                new_index,
-                expected_old_index=old_index,
-            ):
-                changed += 1
-        return changed
+        return self.route_program.replace_scalar_everywhere(old_index, new_index)
 
     def route_locations(self, scalar_index: int) -> tuple[RouteLocation, ...]:
         return tuple(
-            sorted(
-                self._unpack(packed)
-                for packed in self._scalar_to_packed_slots.get(scalar_index, ())
-            )
+            RouteLocation(token_id, route_slot)
+            for token_id, route_slot in self.route_program.route_locations(scalar_index)
         )
 
     def owner_tokens(self, scalar_index: int) -> set[int]:
         return {item.token_id for item in self.route_locations(scalar_index)}
 
     def usage_count(self, scalar_index: int) -> int:
-        return int(self.route_use_count[scalar_index].item())
+        return self.route_program.usage_count(scalar_index)
 
     def iter_used_scalar_indices(self) -> Iterator[int]:
-        yield from self._scalar_to_packed_slots.keys()
+        yield from self.route_program.iter_used_scalars()
 
     def used_scalar_indices(self) -> Tensor:
         return torch.tensor(
-            sorted(self._scalar_to_packed_slots),
+            sorted(self.route_program.iter_used_scalars()),
             dtype=torch.long,
-            device=self.route_ids.device,
+            device=self.pool.values.device,
         )
+
+    def compact_routes(self, *, force: bool = False) -> dict[str, int]:
+        return self.route_program.compact_all(force=force)
+
+    def routing_storage_estimate(self) -> dict[str, int]:
+        return self.route_program.storage_estimate(pool_size=self.pool.capacity)
