@@ -1,6 +1,7 @@
 from .config import DynamicTransformerConfig
 from .model import DynamicTransformer, DynamicTransformerOutput
 from .pools import RouteLocation
+from .routing import RoutePageRecipe, SelectivePageReconstructionStore
 from .structure import DynamicStructureController, StructureEvent
 
 __all__ = [
@@ -9,5 +10,7 @@ __all__ = [
     "DynamicTransformerConfig",
     "DynamicTransformerOutput",
     "RouteLocation",
+    "RoutePageRecipe",
+    "SelectivePageReconstructionStore",
     "StructureEvent",
 ]
