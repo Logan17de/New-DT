@@ -1,0 +1,66 @@
+{
+  "dataset": "allenai/sciq",
+  "dataset_revision": "main",
+  "splits": {
+    "train": 11679,
+    "validation": 1000,
+    "test": 1000
+  },
+  "tokenizer": {
+    "type": "word_space",
+    "lowercase": true,
+    "min_frequency": 2,
+    "max_vocab": null,
+    "vocab_size": 26466,
+    "special_tokens": {
+      "pad_id": 0,
+      "unk_id": 1,
+      "bos_id": 2,
+      "eos_id": 3
+    }
+  },
+  "pretraining_corpus": {
+    "source": "unique train support passages only",
+    "paragraphs": 10473,
+    "characters": 4878376,
+    "utf8_bytes": 4889261,
+    "encoded_tokens": 805311,
+    "sha256": "5f2f91eb9b0fd0b622db16dd6d5ffa338f47c94092e96a23f6a9631ffa12cab0"
+  },
+  "tokenizer_training_corpus": {
+    "source": "all text fields from the train split only",
+    "characters": 6323339,
+    "utf8_bytes": 6334667,
+    "sha256": "7247a695a4112280d41634d7f6e7923d884dcdee746b6f27447097da6ca1c42e"
+  },
+  "oov_statistics": {
+    "train": {
+      "tokens": 1014362,
+      "unknown_tokens": 24639,
+      "unknown_fraction": 0.024290144938394775,
+      "unknown_percent": 2.4290144938394773
+    },
+    "validation": {
+      "tokens": 86075,
+      "unknown_tokens": 3764,
+      "unknown_fraction": 0.04372930583793204,
+      "unknown_percent": 4.372930583793204
+    },
+    "test": {
+      "tokens": 87555,
+      "unknown_tokens": 3684,
+      "unknown_fraction": 0.04207640911427103,
+      "unknown_percent": 4.207640911427103
+    }
+  },
+  "files": {
+    "tokenizer": "tokenizer.json",
+    "vocabulary": "vocab.txt",
+    "tokenizer_training_text": "tokenizer_training.txt",
+    "pretraining_text": "pretrain_train.txt",
+    "pretraining_tokens": "pretrain_train_tokens.pt",
+    "train": "qa_train.jsonl",
+    "validation": "qa_validation.jsonl",
+    "test": "qa_test.jsonl"
+  }
+}
