@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "new-dt"
-version = "0.1.0"
-description = "Reference implementation of a token-owned scalar-pool Dynamic Transformer"
+version = "0.2.0"
+description = "Scalar-neuron Dynamic Transformer with SPRC route storage"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["torch>=2.2"]
+dependencies = ["torch>=2.2", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
