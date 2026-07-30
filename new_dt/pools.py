@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterator
 
 import torch
@@ -79,7 +80,6 @@ class ScalarPool(nn.Module):
         new_index = self.first_free_index()
         self.values[new_index].copy_(self.values[source_index])
         self.active_mask[new_index] = True
-
         if optimizer is not None:
             state = optimizer.state.get(self.values, {})
             for value in state.values():
@@ -109,16 +109,7 @@ class ScalarPool(nn.Module):
 
 
 class RoutedParameterTensor(nn.Module):
-    """Token-owned tensor reconstructed from immutable route pages.
-
-    Persistent routes use Selective Page Reconstruction Compression (SPRC):
-
-    ``base template + optional shared delta + rare token exception``.
-
-    A split writes one exception. Repeated patches can become shared deltas, and a
-    large patch is absorbed into a new immutable template. Scalar sharing remains
-    slot-level and exact; pages are only storage and selective-decoding units.
-    """
+    """Token-owned tensor reconstructed selectively from SPRC route pages."""
 
     def __init__(
         self,
@@ -135,12 +126,17 @@ class RoutedParameterTensor(nn.Module):
         template_promotion_threshold: int = 256,
         template_promotion_fraction: float = 0.25,
         shared_delta_min_reuse: int = 2,
+        cache_pages: int = 256,
+        selector_dense_promotion_fraction: float = 0.35,
+        selector_dense_demotion_fraction: float = 0.15,
+        materialize_token_chunk: int = 128,
     ) -> None:
         super().__init__()
         self.vocab_size = vocab_size
         self.parameter_shape = parameter_shape
         self.route_size = math.prod(parameter_shape)
         self.name = name
+        self.materialize_token_chunk = materialize_token_chunk
 
         self.route_program = SelectivePageReconstructionStore(
             vocab_size,
@@ -152,6 +148,9 @@ class RoutedParameterTensor(nn.Module):
             template_promotion_threshold=template_promotion_threshold,
             template_promotion_fraction=template_promotion_fraction,
             shared_delta_min_reuse=shared_delta_min_reuse,
+            cache_pages=cache_pages,
+            selector_dense_promotion_fraction=selector_dense_promotion_fraction,
+            selector_dense_demotion_fraction=selector_dense_demotion_fraction,
         )
         initial_active = self.route_program.required_pool_size
         capacity = max(initial_active + 8, int(math.ceil(initial_active * growth_factor)))
@@ -161,61 +160,91 @@ class RoutedParameterTensor(nn.Module):
             init_std=init_std,
             name=name,
         )
-        self._route_grad_cache: list[tuple[Tensor, Tensor, Tensor]] = []
+        self._route_grad_cache: list[tuple[Tensor, Tensor, Tensor, Tensor]] = []
 
     @property
     def route_ids(self) -> Tensor:
         """Compatibility/debug view. It materializes all routes on demand."""
 
-        return self.route_program.materialize_all(device=self.pool.values.device).view(
-            self.vocab_size, *self.parameter_shape
-        )
+        return self.route_program.materialize_all(
+            device=self.pool.values.device,
+            token_chunk_size=self.materialize_token_chunk,
+        ).view(self.vocab_size, *self.parameter_shape)
 
     def rebuild_route_index(self) -> None:
         self.route_program.rebuild_indexes()
 
-    def forward(self, token_ids: Tensor, *, collect_route_grads: bool = False) -> Tensor:
-        scalar_ids = self.route_program.resolve(
-            token_ids, device=self.pool.values.device
-        ).view(*token_ids.shape, *self.parameter_shape)
+    def forward_slice(
+        self,
+        token_ids: Tensor,
+        start: int,
+        stop: int,
+        *,
+        collect_route_grads: bool = False,
+    ) -> Tensor:
+        """Gather only one route interval and retain exact slot gradients."""
+
+        scalar_ids = self.route_program.resolve_slice(
+            token_ids,
+            start,
+            stop,
+            device=self.pool.values.device,
+        )
         materialized = self.pool.values[scalar_ids]
         if collect_route_grads and torch.is_grad_enabled():
             materialized.retain_grad()
+            route_slots = torch.arange(start, stop, dtype=torch.long)
             self._route_grad_cache.append(
-                (token_ids.detach(), scalar_ids.detach(), materialized)
+                (token_ids.detach(), route_slots, scalar_ids.detach(), materialized)
             )
         return materialized
 
-    def resolve_page(self, token_id: int, page_id: int) -> Tensor:
-        """Resolve one logical route page without decoding the complete tensor."""
+    def forward(self, token_ids: Tensor, *, collect_route_grads: bool = False) -> Tensor:
+        materialized = self.forward_slice(
+            token_ids,
+            0,
+            self.route_size,
+            collect_route_grads=collect_route_grads,
+        )
+        return materialized.view(*token_ids.shape, *self.parameter_shape)
 
+    def resolve_page(self, token_id: int, page_id: int) -> Tensor:
         return self.route_program.resolve_page(
             token_id, page_id, device=self.pool.values.device
+        )
+
+    def resolve_slice(self, token_ids: Tensor, start: int, stop: int) -> Tensor:
+        return self.route_program.resolve_slice(
+            token_ids, start, stop, device=self.pool.values.device
         )
 
     def page_recipe(self, token_id: int, page_id: int) -> RoutePageRecipe:
         return self.route_program.page_recipe(token_id, page_id)
 
     def materialize_all(self, *, collect_route_grads: bool = False) -> Tensor:
-        token_ids = torch.arange(self.vocab_size, device=self.pool.values.device)
-        return self.forward(token_ids, collect_route_grads=collect_route_grads)
+        if collect_route_grads:
+            token_ids = torch.arange(self.vocab_size, device=self.pool.values.device)
+            return self.forward(token_ids, collect_route_grads=True)
+        ids = self.route_program.materialize_all(
+            device=self.pool.values.device,
+            token_chunk_size=self.materialize_token_chunk,
+        )
+        return self.pool.values[ids].view(self.vocab_size, *self.parameter_shape)
 
     def pop_route_gradient_samples(self) -> Iterator[RouteGradientSample]:
-        """Return exact token/slot gradients before shared-pool scatter addition."""
+        """Return exact token/slot gradients from full or tiled materialization."""
 
         cache, self._route_grad_cache = self._route_grad_cache, []
-        for token_ids, scalar_ids, materialized in cache:
+        for token_ids, route_slots, scalar_ids, materialized in cache:
             if materialized.grad is None:
                 continue
             rows = int(token_ids.numel())
-            route_slots = torch.arange(self.route_size).expand(rows, -1)
+            route_count = int(route_slots.numel())
             yield RouteGradientSample(
                 token_ids=token_ids.reshape(-1).cpu(),
-                route_slots=route_slots,
-                scalar_ids=scalar_ids.reshape(-1, self.route_size).cpu(),
-                gradients=materialized.grad.detach()
-                .reshape(-1, self.route_size)
-                .cpu(),
+                route_slots=route_slots.expand(rows, -1).cpu(),
+                scalar_ids=scalar_ids.reshape(rows, route_count).cpu(),
+                gradients=materialized.grad.detach().reshape(rows, route_count).cpu(),
             )
 
     def scalar_at(self, location: RouteLocation) -> int:
@@ -230,8 +259,6 @@ class RoutedParameterTensor(nn.Module):
         *,
         expected_old_index: int | None = None,
     ) -> bool:
-        """Move one exact route cell by creating/removing an SPRC exception."""
-
         if not 0 <= token_id < self.vocab_size:
             raise IndexError("token_id outside vocabulary")
         if not 0 <= route_slot < self.route_size:
@@ -247,8 +274,6 @@ class RoutedParameterTensor(nn.Module):
 
     @torch.no_grad()
     def replace_scalar_everywhere(self, old_index: int, new_index: int) -> int:
-        """Redirect exact owners found from templates plus sparse deviations."""
-
         return self.route_program.replace_scalar_everywhere(old_index, new_index)
 
     def route_locations(self, scalar_index: int) -> tuple[RouteLocation, ...]:
@@ -278,3 +303,9 @@ class RoutedParameterTensor(nn.Module):
 
     def routing_storage_estimate(self) -> dict[str, int]:
         return self.route_program.storage_estimate(pool_size=self.pool.capacity)
+
+    def export_packed(self, path: str | Path) -> dict[str, int]:
+        return self.route_program.export_packed(path, pool_size=self.pool.capacity)
+
+    def route_cache_stats(self) -> dict[str, int]:
+        return self.route_program.cache_stats()

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class DynamicTransformerConfig:
-    """Configuration for the scalar-routed Dynamic Transformer reference model."""
+    """Configuration for the scalar-routed Dynamic Transformer."""
 
     vocab_size: int = 64
     d_model: int = 16
@@ -27,6 +27,15 @@ class DynamicTransformerConfig:
     route_template_promotion_threshold: int = 256
     route_template_promotion_fraction: float = 0.25
     route_shared_delta_min_reuse: int = 2
+    route_cache_pages: int = 256
+    route_selector_dense_promotion_fraction: float = 0.35
+    route_selector_dense_demotion_fraction: float = 0.15
+
+    # Peak-memory controls. Routed matrices and the LM head are reconstructed in
+    # output-row tiles instead of expanding an entire token-owned matrix at once.
+    route_linear_out_tile: int = 64
+    route_lm_head_tile: int = 1024
+    route_materialize_token_chunk: int = 128
 
     # Rotary position embedding. No additive positional vector is stored.
     rope_theta: float = 10_000.0
@@ -62,5 +71,18 @@ class DynamicTransformerConfig:
             raise ValueError("route_template_promotion_fraction must be in (0, 1]")
         if self.route_shared_delta_min_reuse < 2:
             raise ValueError("route_shared_delta_min_reuse must be at least 2")
+        if self.route_cache_pages < 0:
+            raise ValueError("route_cache_pages must be non-negative")
+        if not (
+            0
+            < self.route_selector_dense_demotion_fraction
+            < self.route_selector_dense_promotion_fraction
+            <= 1
+        ):
+            raise ValueError("selector dense thresholds are inconsistent")
+        if self.route_linear_out_tile <= 0 or self.route_lm_head_tile <= 0:
+            raise ValueError("route execution tile sizes must be positive")
+        if self.route_materialize_token_chunk <= 0:
+            raise ValueError("route_materialize_token_chunk must be positive")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")

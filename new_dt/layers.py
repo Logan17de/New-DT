@@ -18,6 +18,10 @@ def _routing_kwargs(config: DynamicTransformerConfig) -> dict[str, int | float]:
         "template_promotion_threshold": config.route_template_promotion_threshold,
         "template_promotion_fraction": config.route_template_promotion_fraction,
         "shared_delta_min_reuse": config.route_shared_delta_min_reuse,
+        "cache_pages": config.route_cache_pages,
+        "selector_dense_promotion_fraction": config.route_selector_dense_promotion_fraction,
+        "selector_dense_demotion_fraction": config.route_selector_dense_demotion_fraction,
+        "materialize_token_chunk": config.route_materialize_token_chunk,
     }
 
 
@@ -35,7 +39,7 @@ class SharedRMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """RoPE rotations applied directly to Q/K; no additive position vectors."""
+    """RoPE rotations with a device/dtype-aware cosine/sine cache."""
 
     def __init__(self, head_dim: int, theta: float = 10_000.0) -> None:
         super().__init__()
@@ -45,21 +49,28 @@ class RotaryEmbedding(nn.Module):
             theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=True)
+        self._rope_cache: dict[tuple[str, torch.dtype, int], tuple[Tensor, Tensor]] = {}
 
-    def _rotate(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    @staticmethod
+    def _rotate(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         even = x[..., 0::2]
         odd = x[..., 1::2]
-        output = torch.empty_like(x)
-        output[..., 0::2] = even * cos - odd * sin
-        output[..., 1::2] = even * sin + odd * cos
-        return output
+        return torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1).flatten(-2)
+
+    def _cos_sin(self, seq_len: int, reference: Tensor) -> tuple[Tensor, Tensor]:
+        key = (str(reference.device), reference.dtype, seq_len)
+        cached = self._rope_cache.get(key)
+        if cached is not None:
+            return cached
+        positions = torch.arange(seq_len, device=reference.device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq.to(device=reference.device))
+        cos = angles.cos().to(dtype=reference.dtype).view(1, 1, seq_len, -1)
+        sin = angles.sin().to(dtype=reference.dtype).view(1, 1, seq_len, -1)
+        self._rope_cache[key] = (cos, sin)
+        return cos, sin
 
     def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
-        seq_len = q.shape[-2]
-        positions = torch.arange(seq_len, device=q.device, dtype=self.inv_freq.dtype)
-        angles = torch.outer(positions, self.inv_freq.to(device=q.device))
-        cos = angles.cos().to(dtype=q.dtype).view(1, 1, seq_len, -1)
-        sin = angles.sin().to(dtype=q.dtype).view(1, 1, seq_len, -1)
+        cos, sin = self._cos_sin(q.shape[-2], q)
         return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
 
 
@@ -81,7 +92,7 @@ class TokenRoutedEmbedding(nn.Module):
 
 
 class TokenRoutedLinear(nn.Module):
-    """A token-specific matrix reconstructed selectively from scalar route pages."""
+    """Token-specific matrix multiplication with bounded route materialization."""
 
     def __init__(
         self,
@@ -94,6 +105,7 @@ class TokenRoutedLinear(nn.Module):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        self.out_tile = min(config.route_linear_out_tile, out_features)
         self.parameters_by_token = RoutedParameterTensor(
             config.vocab_size,
             (out_features, in_features),
@@ -111,10 +123,22 @@ class TokenRoutedLinear(nn.Module):
         *,
         collect_route_grads: bool = False,
     ) -> Tensor:
-        weights = self.parameters_by_token(
-            token_ids, collect_route_grads=collect_route_grads
-        )
-        return torch.einsum("...oi,...i->...o", weights, x)
+        outputs: list[Tensor] = []
+        for out_start in range(0, self.out_features, self.out_tile):
+            out_stop = min(self.out_features, out_start + self.out_tile)
+            route_start = out_start * self.in_features
+            route_stop = out_stop * self.in_features
+            flat_weights = self.parameters_by_token.forward_slice(
+                token_ids,
+                route_start,
+                route_stop,
+                collect_route_grads=collect_route_grads,
+            )
+            weights = flat_weights.view(
+                *token_ids.shape, out_stop - out_start, self.in_features
+            )
+            outputs.append(torch.einsum("...oi,...i->...o", weights, x))
+        return torch.cat(outputs, dim=-1) if len(outputs) > 1 else outputs[0]
 
 
 class DynamicSelfAttention(nn.Module):
@@ -168,9 +192,7 @@ class DynamicSelfAttention(nn.Module):
         )
         batch, _, seq, _ = attended.shape
         attended = attended.transpose(1, 2).contiguous().view(batch, seq, -1)
-        return self.o_proj(
-            attended, token_ids, collect_route_grads=collect_route_grads
-        )
+        return self.o_proj(attended, token_ids, collect_route_grads=collect_route_grads)
 
 
 class DynamicFFN(nn.Module):
@@ -197,14 +219,10 @@ class DynamicFFN(nn.Module):
         up = self.up_proj(x, token_ids, collect_route_grads=collect_route_grads)
         gate = self.gate_proj(x, token_ids, collect_route_grads=collect_route_grads)
         hidden = F.silu(gate) * up
-        return self.down_proj(
-            hidden, token_ids, collect_route_grads=collect_route_grads
-        )
+        return self.down_proj(hidden, token_ids, collect_route_grads=collect_route_grads)
 
 
 class DynamicTransformerBlock(nn.Module):
-    """Token-owned attention/FFN surrounded by shared norm and residual plumbing."""
-
     def __init__(self, config: DynamicTransformerConfig, layer_index: int) -> None:
         super().__init__()
         self.attention_norm = SharedRMSNorm(config.d_model)
@@ -238,10 +256,12 @@ class DynamicTransformerBlock(nn.Module):
 
 
 class TokenRoutedLMHead(nn.Module):
-    """Candidate output tokens own their scalar-routed LM vectors."""
+    """Candidate vectors reconstructed in vocabulary tiles to cap peak memory."""
 
     def __init__(self, config: DynamicTransformerConfig) -> None:
         super().__init__()
+        self.vocab_size = config.vocab_size
+        self.vocab_tile = min(config.route_lm_head_tile, config.vocab_size)
         self.parameters_by_token = RoutedParameterTensor(
             config.vocab_size,
             (config.d_model,),
@@ -253,7 +273,12 @@ class TokenRoutedLMHead(nn.Module):
         )
 
     def forward(self, x: Tensor, *, collect_route_grads: bool = False) -> Tensor:
-        output_vectors = self.parameters_by_token.materialize_all(
-            collect_route_grads=collect_route_grads
-        )
-        return torch.einsum("btd,vd->btv", x, output_vectors)
+        logits: list[Tensor] = []
+        for start in range(0, self.vocab_size, self.vocab_tile):
+            stop = min(self.vocab_size, start + self.vocab_tile)
+            candidate_ids = torch.arange(start, stop, device=x.device)
+            output_vectors = self.parameters_by_token(
+                candidate_ids, collect_route_grads=collect_route_grads
+            )
+            logits.append(torch.einsum("btd,vd->btv", x, output_vectors))
+        return torch.cat(logits, dim=-1) if len(logits) > 1 else logits[0]
