@@ -66,8 +66,8 @@ for all three QA splits.
 
 ## Use in the small comparison
 
-The current comparison runner deterministically rebuilds the same tokenizer from
-its `--data` text. To pretrain on the SciQ support corpus, pass the generated text:
+For an immediate architecture-only language-model comparison, pass the generated
+support corpus to both models:
 
 ```bash
 new-dt-compare \
@@ -83,8 +83,9 @@ new-dt-compare \
   --steps 1000
 ```
 
-Because `WordSpaceTokenizer` is deterministic, matching `--lowercase`,
-`--min-frequency`, and `--max-vocab` recreates the same support-corpus vocabulary.
-The saved tokenizer additionally includes question/answer vocabulary for later QA
-evaluation, so retain `data/sciq/tokenizer.json` as the canonical tokenizer for the
-full pretraining-plus-QA experiment.
+That command rebuilds a support-only vocabulary, but it remains a fair GPT-versus-
+sDT comparison because both models receive exactly the same tokenizer and batches.
+It will not have identical IDs to `tokenizer.json`, whose vocabulary also covers
+train questions and answers. Preserve `tokenizer.json` and
+`pretrain_train_tokens.pt` as the canonical artifacts for the later pretraining-plus-
+QA workflow.
