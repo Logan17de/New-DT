@@ -141,6 +141,29 @@ python train_demo.py --steps 20 --grad-accum 2
 python benchmarks/benchmark_sprc.py
 ```
 
+## Prepare SciQ and the word-space tokenizer
+
+Download the science corpus, create a support-only pretraining file, train the
+word-space tokenizer from SciQ train text, and save token IDs plus held-out QA
+files:
+
+```bash
+pip install -e ".[data]"
+new-dt-prepare-sciq \
+  --output data/sciq \
+  --lowercase \
+  --min-frequency 2
+```
+
+The root command is equivalent:
+
+```bash
+python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2
+```
+
+See [docs/SCIQ_PREPARATION.md](docs/SCIQ_PREPARATION.md) for the generated files,
+data-separation policy, and Colab workflow.
+
 ## Small GPT versus sDT comparison
 
 Train a conventional shared-matrix GPT and sDT on the same dataset-derived
@@ -217,6 +240,7 @@ print(model.routing_storage_summary())
 The repository implements exact SPRC split/merge semantics, adaptive selectors,
 immutable templates, shared deltas, exceptions, compaction, exact reverse queries,
 packed on-disk containers, mmap selective reads, route caches, tiled execution,
-RoPE, storage telemetry, benchmark coverage, and a matched small-GPT comparison
-runner. Native fused CUDA decoding and distributed route sharding remain optional
-future backends; the current tiled PyTorch path is exact and works on CPU or GPU.
+RoPE, storage telemetry, benchmark coverage, a matched small-GPT comparison runner,
+and SciQ word-space data preparation. Native fused CUDA decoding and distributed
+route sharding remain optional future backends; the current tiled PyTorch path is
+exact and works on CPU or GPU.
