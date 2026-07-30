@@ -28,6 +28,33 @@ python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2
 Use `--force` to replace files in an existing output directory. `--max-vocab N`
 limits the vocabulary including `<pad>`, `<unk>`, `<bos>`, and `<eos>`.
 
+## Complete Google Colab block
+
+Run this in one Colab code cell:
+
+```bash
+!rm -rf /content/New-DT
+!git clone https://github.com/Logan17de/New-DT.git /content/New-DT
+%cd /content/New-DT
+!git pull origin main
+!pip install -q -e ".[data]"
+!python prepare_sciq.py \
+  --output /content/New-DT/data/sciq \
+  --lowercase \
+  --min-frequency 2 \
+  --force
+!ls -lh /content/New-DT/data/sciq
+```
+
+For later Colab sessions where the repository folder already exists:
+
+```bash
+%cd /content/New-DT
+!git pull origin main
+!pip install -q -e ".[data]"
+!python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2 --force
+```
+
 ## Data separation
 
 Tokenizer vocabulary training uses these fields from SciQ train only:
