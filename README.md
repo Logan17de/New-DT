@@ -41,7 +41,8 @@ Dense `vocab_size × route_size` route tensors have been replaced by SPRC:
 
 ```text
 token + page
-    → immutable base-template selector
+    → compact adaptive template selector
+    → immutable base template
     → optional shared sparse delta
     → rare token-specific exceptions
     → exact resolved neuron IDs
@@ -64,31 +65,43 @@ The template never changes.
 ### Delta and template promotion
 
 - Small unique changes remain exceptions.
-- The same patch reused by multiple token pages becomes one shared delta.
+- The same full patch reused by multiple token pages becomes one shared delta.
 - A large patch is resolved once and absorbed into a new immutable template.
 - Merges remove or rewrite patches and may make old templates unused.
 
 ### Exact reverse ownership
 
-SPRC does not store a dense second copy of every relation edge. Exact owners are
-derived from:
+SPRC avoids a dense second copy of every relation edge. Exact owners are derived
+from scalar-to-template references, compact selectors, and sparse deviations.
+Template-user lists are built lazily and cached only when split/merge needs them.
 
-```text
-template → token users
-template → scalar offsets
-sparse deviations → exact route locations
+### Optimized execution
+
+- Per-token selector defaults replace the dense vocabulary-by-page selector tensor.
+- Sparse page selector divergence promotes to a dense page only when worthwhile.
+- Immutable template+delta pages use an LRU cache.
+- Batch tokens are grouped by page recipe and decoded once per group.
+- Q/K/V/O and FFN matrices are reconstructed in output-row tiles.
+- The LM head is reconstructed in vocabulary tiles.
+- Route gradients retain their exact original slots across every tile.
+- RoPE cosine/sine tensors are cached by sequence length, device, and dtype.
+
+### Packed files and selective reads
+
+```python
+routed.export_packed("embedding.sprc")
+
+from new_dt import PackedSPRCReader
+with PackedSPRCReader("embedding.sprc") as reader:
+    page = reader.resolve_page(token_id=732, page_id=18, device="cuda")
 ```
 
-This preserves exact split and merge while keeping the persistent representation
-program-based.
+The packed container uses arbitrary-width exact integer IDs, independent template,
+delta, and recipe indexes, atomic replacement, payload checksums, and memory-mapped
+page reads. `DynamicTransformer.export_routing(directory)` exports every routed
+pool plus a manifest.
 
-### Selective decoding
-
-`resolve_page(token_id, page_id)` reconstructs one independent page. Production
-kernels can decode only the current layer/matrix tile rather than materializing a
-complete token route.
-
-See [docs/SPRC.md](docs/SPRC.md) for the storage model.
+See [docs/SPRC.md](docs/SPRC.md) for the complete storage/runtime design.
 
 ## RoPE
 
@@ -121,10 +134,11 @@ pip install -e ".[dev]"
 pytest
 ```
 
-Run the synthetic demo:
+Run the synthetic demo and routing benchmark:
 
 ```bash
 python train_demo.py --steps 20 --grad-accum 2
+python benchmarks/benchmark_sprc.py
 ```
 
 ## Minimal usage
@@ -145,6 +159,8 @@ config = DynamicTransformerConfig(
     ffn_dim=16,
     route_page_size=1024,
     route_templates_per_page=16,
+    route_linear_out_tile=64,
+    route_lm_head_tile=1024,
 )
 model = DynamicTransformer(config)
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
@@ -160,13 +176,14 @@ controller.maybe_restructure(model, optimizer, optimizer_step=1)
 optimizer.zero_grad(set_to_none=True)
 
 print(model.pool_summary())
+print(model.routing_storage_summary())
 ```
 
-## Reference implementation status
+## Implementation status
 
-The repository now implements the exact SPRC semantics, immutable templates,
-shared deltas, exceptions, compaction, program-derived reverse ownership, RoPE,
-and split/merge integration. The Python implementation prioritizes correctness
-and inspectability. Packed selector streams, on-disk page recipes, fused
-unpack-and-gather CUDA kernels, tile caches, and distributed storage remain the
-next performance layer.
+The repository implements exact SPRC split/merge semantics, adaptive selectors,
+immutable templates, shared deltas, exceptions, compaction, exact reverse queries,
+packed on-disk containers, mmap selective reads, route caches, tiled execution,
+RoPE, storage telemetry, and benchmark coverage. Native fused CUDA decoding and
+distributed route sharding remain optional future backends; the current tiled
+PyTorch path is exact and works on CPU or GPU.
