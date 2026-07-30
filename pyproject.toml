@@ -13,6 +13,9 @@ dependencies = ["torch>=2.2", "numpy>=1.26"]
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
 
+[project.scripts]
+new-dt-compare = "new_dt.comparison:main"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
