@@ -141,6 +141,39 @@ python train_demo.py --steps 20 --grad-accum 2
 python benchmarks/benchmark_sprc.py
 ```
 
+## Small GPT versus sDT comparison
+
+Train a conventional shared-matrix GPT and sDT on the same dataset-derived
+word-space vocabulary and the exact same precomputed batches:
+
+```bash
+python compare_small.py \
+  --data dataset.txt \
+  --model both \
+  --d-model 32 \
+  --heads 4 \
+  --layers 2 \
+  --ffn-dim 128 \
+  --seq-len 64 \
+  --steps 500 \
+  --batch-size 8
+```
+
+The installed command is also available:
+
+```bash
+new-dt-compare --data dataset.txt --model both ...
+```
+
+Both models use RMSNorm, RoPE, SwiGLU, causal attention, bias-free projections,
+identical optimizer settings, and **untied** embedding/LM-head storage. The GPT
+uses conventional shared Q/K/V/O and FFN matrices; sDT uses token-owned scalar
+routes. Set `--structure-interval 0` for a static-routing ablation or use a positive
+interval to enable split/merge.
+
+See [docs/SMALL_COMPARISON.md](docs/SMALL_COMPARISON.md) for all CLI controls,
+fairness rules, output files, and recommended starting configurations.
+
 ## Minimal usage
 
 ```python
@@ -184,6 +217,6 @@ print(model.routing_storage_summary())
 The repository implements exact SPRC split/merge semantics, adaptive selectors,
 immutable templates, shared deltas, exceptions, compaction, exact reverse queries,
 packed on-disk containers, mmap selective reads, route caches, tiled execution,
-RoPE, storage telemetry, and benchmark coverage. Native fused CUDA decoding and
-distributed route sharding remain optional future backends; the current tiled
-PyTorch path is exact and works on CPU or GPU.
+RoPE, storage telemetry, benchmark coverage, and a matched small-GPT comparison
+runner. Native fused CUDA decoding and distributed route sharding remain optional
+future backends; the current tiled PyTorch path is exact and works on CPU or GPU.
