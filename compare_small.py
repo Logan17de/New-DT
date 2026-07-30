@@ -1,4 +1,4 @@
-from new_dt.training_cli import main
+from new_dt.lookup_training_cli import main
 
 
 if __name__ == "__main__":
