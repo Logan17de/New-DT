@@ -8,21 +8,28 @@ from new_dt import (
     DynamicTransformerConfig,
     RouteLocation,
 )
-from new_dt.layers import SharedRMSNorm
+from new_dt.layers import RotaryEmbedding, SharedRMSNorm
 from new_dt.structure import OwnerGradientStat
 
 
-def tiny_config() -> DynamicTransformerConfig:
-    return DynamicTransformerConfig(
-        vocab_size=8,
-        d_model=4,
-        n_heads=2,
-        n_layers=1,
-        ffn_dim=8,
-        max_seq_len=8,
-        initial_shared_fraction=0.5,
-        pool_growth_factor=1.5,
-    )
+def tiny_config(**overrides: object) -> DynamicTransformerConfig:
+    values: dict[str, object] = {
+        "vocab_size": 8,
+        "d_model": 4,
+        "n_heads": 2,
+        "n_layers": 1,
+        "ffn_dim": 8,
+        "max_seq_len": 8,
+        "initial_shared_fraction": 0.5,
+        "pool_growth_factor": 2.0,
+        "route_page_size": 4,
+        "route_templates_per_page": 2,
+        "route_delta_promotion_threshold": 3,
+        "route_template_promotion_threshold": 4,
+        "route_template_promotion_fraction": 1.0,
+    }
+    values.update(overrides)
+    return DynamicTransformerConfig(**values)  # type: ignore[arg-type]
 
 
 def test_forward_backward_and_adam() -> None:
@@ -36,7 +43,7 @@ def test_forward_backward_and_adam() -> None:
     optimizer.step()
 
 
-def test_pool_families_are_separate_and_norm_is_shared() -> None:
+def test_pool_families_are_separate_norm_is_shared_and_rope_is_used() -> None:
     model = DynamicTransformer(tiny_config())
     pools = {name: routed.pool for name, routed in model.routed_tensors()}
     assert "embedding.parameters_by_token" in pools
@@ -46,6 +53,8 @@ def test_pool_families_are_separate_and_norm_is_shared() -> None:
     assert len({id(pool.values) for pool in pools.values()}) == len(pools)
     assert isinstance(model.layers[0].attention_norm, SharedRMSNorm)
     assert isinstance(model.layers[0].ffn_norm, SharedRMSNorm)
+    assert isinstance(model.layers[0].attention.rope, RotaryEmbedding)
+    assert not hasattr(model, "position_encoding")
 
 
 def test_reverse_map_tracks_same_scalar_at_different_slots() -> None:
@@ -53,6 +62,7 @@ def test_reverse_map_tracks_same_scalar_at_different_slots() -> None:
     routed = model.embedding.parameters_by_token
     source = int(routed.route_ids[0, 0].item())
     replaced = int(routed.route_ids[1, 3].item())
+    replaced_before = routed.usage_count(replaced)
 
     assert routed.reroute_slot(1, 3, source, expected_old_index=replaced)
     locations = set(routed.route_locations(source))
@@ -60,10 +70,10 @@ def test_reverse_map_tracks_same_scalar_at_different_slots() -> None:
     assert RouteLocation(1, 0) in locations
     assert RouteLocation(1, 3) in locations
     assert routed.usage_count(source) == len(locations)
-    assert routed.usage_count(replaced) == 0
+    assert routed.usage_count(replaced) == replaced_before - 1
 
 
-def test_split_reroutes_one_exact_slot_and_copies_adam_state() -> None:
+def test_split_is_an_exception_and_template_stays_immutable() -> None:
     model = DynamicTransformer(tiny_config())
     routed = model.embedding.parameters_by_token
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -75,27 +85,106 @@ def test_split_reroutes_one_exact_slot_and_copies_adam_state() -> None:
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
-    source = int(routed.route_ids[0, 0].item())
-    old_slot_one = int(routed.route_ids[0, 1].item())
-    assert routed.reroute_slot(0, 1, source, expected_old_index=old_slot_one)
+    recipe_before = routed.page_recipe(0, 0)
+    template_before = routed.route_program._templates[0][recipe_before.template_id].clone()
+    source = routed.scalar_at(RouteLocation(0, 0))
     new_index = routed.pool.split(source, optimizer=optimizer)
-    assert routed.reroute_slot(0, 1, new_index, expected_old_index=source)
+    assert routed.reroute_slot(0, 0, new_index, expected_old_index=source)
 
-    assert int(routed.route_ids[0, 0].item()) == source
-    assert int(routed.route_ids[0, 1].item()) == new_index
-    assert int(routed.route_ids[1, 0].item()) == source
-    assert torch.equal(routed.pool.values[source], routed.pool.values[new_index])
+    recipe_after = routed.page_recipe(0, 0)
+    assert recipe_after.template_id == recipe_before.template_id
+    assert recipe_after.exception_count == 1
+    assert torch.equal(
+        routed.route_program._templates[0][recipe_before.template_id], template_before
+    )
+    assert routed.scalar_at(RouteLocation(0, 0)) == new_index
+    assert routed.scalar_at(RouteLocation(1, 0)) == source
 
     state = optimizer.state[routed.pool.values]
     assert torch.equal(state["exp_avg"][source], state["exp_avg"][new_index])
     assert torch.equal(state["exp_avg_sq"][source], state["exp_avg_sq"][new_index])
 
 
+def test_repeated_exceptions_promote_to_shared_delta() -> None:
+    model = DynamicTransformer(
+        tiny_config(
+            route_delta_promotion_threshold=1,
+            route_template_promotion_threshold=99,
+            route_template_promotion_fraction=1.0,
+            route_shared_delta_min_reuse=2,
+        )
+    )
+    routed = model.embedding.parameters_by_token
+    source = routed.scalar_at(RouteLocation(0, 1))
+    target = routed.pool.split(source)
+
+    assert routed.reroute_slot(0, 1, target, expected_old_index=source)
+    assert routed.page_recipe(0, 0).delta_id is None
+    assert routed.reroute_slot(1, 1, target, expected_old_index=source)
+
+    first = routed.page_recipe(0, 0)
+    second = routed.page_recipe(1, 0)
+    assert first.delta_id is not None
+    assert first.delta_id == second.delta_id
+    assert first.exception_count == 0
+    assert second.exception_count == 0
+    assert routed.scalar_at(RouteLocation(0, 1)) == target
+    assert routed.scalar_at(RouteLocation(1, 1)) == target
+
+
+def test_large_delta_is_absorbed_into_new_immutable_template() -> None:
+    model = DynamicTransformer(
+        tiny_config(
+            route_delta_promotion_threshold=99,
+            route_template_promotion_threshold=2,
+            route_template_promotion_fraction=0.5,
+        )
+    )
+    routed = model.embedding.parameters_by_token
+    original_recipe = routed.page_recipe(0, 0)
+    original_template = routed.route_program._templates[0][
+        original_recipe.template_id
+    ].clone()
+
+    old_zero = routed.scalar_at(RouteLocation(0, 0))
+    old_one = routed.scalar_at(RouteLocation(0, 1))
+    target_zero = routed.scalar_at(RouteLocation(0, 2))
+    target_one = routed.scalar_at(RouteLocation(0, 3))
+    assert routed.reroute_slot(0, 0, target_zero, expected_old_index=old_zero)
+    assert routed.reroute_slot(0, 1, target_one, expected_old_index=old_one)
+
+    promoted = routed.page_recipe(0, 0)
+    assert promoted.template_id != original_recipe.template_id
+    assert promoted.delta_id is None
+    assert promoted.exception_count == 0
+    assert torch.equal(
+        routed.route_program._templates[0][original_recipe.template_id],
+        original_template,
+    )
+    assert routed.scalar_at(RouteLocation(0, 0)) == target_zero
+    assert routed.scalar_at(RouteLocation(0, 1)) == target_one
+
+
+def test_page_resolution_and_storage_estimate_are_selective() -> None:
+    model = DynamicTransformer(tiny_config())
+    routed = model.layers[0].ffn.up_proj.parameters_by_token
+    page = routed.resolve_page(0, 1)
+    full = routed.route_program.resolve_token(0)
+    start = routed.route_program.page_size
+    assert torch.equal(page.cpu(), full[start : start + page.numel()])
+
+    estimate = routed.routing_storage_estimate()
+    dense_int64_bytes = routed.vocab_size * routed.route_size * 8
+    assert estimate["total_bytes"] < dense_int64_bytes
+    assert estimate["selector_bits"] > 0
+    assert estimate["template_bits"] > 0
+
+
 def test_gradient_collection_keeps_slots_separate_even_when_pool_grad_cancels() -> None:
     model = DynamicTransformer(tiny_config())
     routed = model.embedding.parameters_by_token
-    source = int(routed.route_ids[0, 0].item())
-    old_slot_one = int(routed.route_ids[0, 1].item())
+    source = routed.scalar_at(RouteLocation(0, 0))
+    old_slot_one = routed.scalar_at(RouteLocation(0, 1))
     assert routed.reroute_slot(0, 1, source, expected_old_index=old_slot_one)
 
     values = routed(torch.tensor([0]), collect_route_grads=True)
@@ -114,8 +203,8 @@ def test_controller_splits_only_conflicting_route_slot() -> None:
     model = DynamicTransformer(tiny_config())
     routed = model.embedding.parameters_by_token
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    source = int(routed.route_ids[0, 0].item())
-    old_slot_one = int(routed.route_ids[0, 1].item())
+    source = routed.scalar_at(RouteLocation(0, 0))
+    old_slot_one = routed.scalar_at(RouteLocation(0, 1))
     assert routed.reroute_slot(0, 1, source, expected_old_index=old_slot_one)
 
     controller = DynamicStructureController(
@@ -141,19 +230,22 @@ def test_controller_splits_only_conflicting_route_slot() -> None:
     assert event.kind == "split"
     assert event.token_id == 0
     assert event.route_slot == 1
-    assert int(routed.route_ids[0, 0].item()) == source
-    assert int(routed.route_ids[0, 1].item()) == event.target_scalar
-    assert int(routed.route_ids[1, 0].item()) == source
+    assert routed.scalar_at(RouteLocation(0, 0)) == source
+    assert routed.scalar_at(RouteLocation(0, 1)) == event.target_scalar
+    assert routed.scalar_at(RouteLocation(1, 0)) == source
 
 
-def test_merge_uses_reverse_map_and_only_affected_neighborhood() -> None:
+def test_merge_uses_program_reverse_index_and_compacts_routes() -> None:
     model = DynamicTransformer(tiny_config())
     routed = model.embedding.parameters_by_token
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     module_name = "embedding.parameters_by_token"
 
-    left = int(routed.route_ids[0, 2].item())
-    right = int(routed.route_ids[1, 2].item())
+    left_location = RouteLocation(0, 2)
+    right_location = RouteLocation(4, 2)
+    left = routed.scalar_at(left_location)
+    right = routed.scalar_at(right_location)
+    assert left != right
     with torch.no_grad():
         routed.pool.values[left] = 0.123400
         routed.pool.values[right] = 0.123405
@@ -169,7 +261,9 @@ def test_merge_uses_reverse_map_and_only_affected_neighborhood() -> None:
         max_splits_per_pass=0,
     )
     controller.stats[(module_name, 0, 2, left)] = OwnerGradientStat(0.02, 0.02, 3)
-    controller.stats[(module_name, 1, 2, right)] = OwnerGradientStat(0.0201, 0.0201, 3)
+    controller.stats[(module_name, 4, 2, right)] = OwnerGradientStat(
+        0.0201, 0.0201, 3
+    )
     controller._affected_scalars[module_name].add(left)
     controller._optimizer_active_scalars[module_name].update({left, right})
 

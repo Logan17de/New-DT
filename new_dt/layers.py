@@ -10,6 +10,17 @@ from .config import DynamicTransformerConfig
 from .pools import RoutedParameterTensor
 
 
+def _routing_kwargs(config: DynamicTransformerConfig) -> dict[str, int | float]:
+    return {
+        "page_size": config.route_page_size,
+        "templates_per_page": config.route_templates_per_page,
+        "delta_promotion_threshold": config.route_delta_promotion_threshold,
+        "template_promotion_threshold": config.route_template_promotion_threshold,
+        "template_promotion_fraction": config.route_template_promotion_fraction,
+        "shared_delta_min_reuse": config.route_shared_delta_min_reuse,
+    }
+
+
 class SharedRMSNorm(nn.Module):
     """Shared numerical stabilization; it is not token-owned capacity."""
 
@@ -23,6 +34,35 @@ class SharedRMSNorm(nn.Module):
         return x * rms * self.weight
 
 
+class RotaryEmbedding(nn.Module):
+    """RoPE rotations applied directly to Q/K; no additive position vectors."""
+
+    def __init__(self, head_dim: int, theta: float = 10_000.0) -> None:
+        super().__init__()
+        if head_dim % 2:
+            raise ValueError("RoPE head dimension must be even")
+        inv_freq = 1.0 / (
+            theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=True)
+
+    def _rotate(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        even = x[..., 0::2]
+        odd = x[..., 1::2]
+        output = torch.empty_like(x)
+        output[..., 0::2] = even * cos - odd * sin
+        output[..., 1::2] = even * sin + odd * cos
+        return output
+
+    def forward(self, q: Tensor, k: Tensor) -> tuple[Tensor, Tensor]:
+        seq_len = q.shape[-2]
+        positions = torch.arange(seq_len, device=q.device, dtype=self.inv_freq.dtype)
+        angles = torch.outer(positions, self.inv_freq.to(device=q.device))
+        cos = angles.cos().to(dtype=q.dtype).view(1, 1, seq_len, -1)
+        sin = angles.sin().to(dtype=q.dtype).view(1, 1, seq_len, -1)
+        return self._rotate(q, cos, sin), self._rotate(k, cos, sin)
+
+
 class TokenRoutedEmbedding(nn.Module):
     def __init__(self, config: DynamicTransformerConfig) -> None:
         super().__init__()
@@ -33,6 +73,7 @@ class TokenRoutedEmbedding(nn.Module):
             growth_factor=config.pool_growth_factor,
             init_std=config.init_std,
             name="embedding",
+            **_routing_kwargs(config),
         )
 
     def forward(self, token_ids: Tensor, *, collect_route_grads: bool = False) -> Tensor:
@@ -40,7 +81,7 @@ class TokenRoutedEmbedding(nn.Module):
 
 
 class TokenRoutedLinear(nn.Module):
-    """A full token-specific matrix assembled from one scalar pool."""
+    """A token-specific matrix reconstructed selectively from scalar route pages."""
 
     def __init__(
         self,
@@ -60,6 +101,7 @@ class TokenRoutedLinear(nn.Module):
             growth_factor=config.pool_growth_factor,
             init_std=config.init_std / math.sqrt(max(in_features, 1)),
             name=name,
+            **_routing_kwargs(config),
         )
 
     def forward(
@@ -81,6 +123,7 @@ class DynamicSelfAttention(nn.Module):
         self.n_heads = config.n_heads
         self.head_dim = config.d_model // config.n_heads
         self.dropout = config.dropout
+        self.rope = RotaryEmbedding(self.head_dim, theta=config.rope_theta)
         prefix = f"attention.layer_{layer_index}"
         self.q_proj = TokenRoutedLinear(
             config, config.d_model, config.d_model, name=f"{prefix}.q"
@@ -115,6 +158,7 @@ class DynamicSelfAttention(nn.Module):
         v = self._split_heads(
             self.v_proj(x, token_ids, collect_route_grads=collect_route_grads)
         )
+        q, k = self.rope(q, k)
         attended = F.scaled_dot_product_attention(
             q,
             k,
@@ -176,7 +220,6 @@ class DynamicTransformerBlock(nn.Module):
         *,
         collect_route_grads: bool = False,
     ) -> Tensor:
-        # Residual addition is common and parameter-free.
         x = x + self.dropout(
             self.attention(
                 self.attention_norm(x),
@@ -206,6 +249,7 @@ class TokenRoutedLMHead(nn.Module):
             growth_factor=config.pool_growth_factor,
             init_std=config.init_std,
             name="lm_head",
+            **_routing_kwargs(config),
         )
 
     def forward(self, x: Tensor, *, collect_route_grads: bool = False) -> Tensor:
