@@ -12,9 +12,11 @@ dependencies = ["torch>=2.2", "numpy>=1.26"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+data = ["datasets>=3.0"]
 
 [project.scripts]
 new-dt-compare = "new_dt.comparison:main"
+new-dt-prepare-sciq = "new_dt.prepare_sciq:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
