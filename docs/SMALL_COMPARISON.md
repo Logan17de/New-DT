@@ -1,105 +1,92 @@
 # Small shared-GPT versus sDT comparison
 
-This experiment compares two causal language models using one dataset, one
-word-space tokenizer, one architecture configuration, one optimizer schedule, and
-exactly the same precomputed train/evaluation batches.
+This experiment compares two causal language models using the same tokenizer,
+pre-tokenized corpus, architecture dimensions, optimizer schedule, and exact batch
+start positions.
 
 ## Models
 
-### `gpt`
+### Shared GPT
 
-A conventional small GPT-style model with shared matrices:
-
-- one shared token embedding table;
+- conventional shared token embedding;
 - shared Q/K/V/O matrices per layer;
 - shared SwiGLU Up/Gate/Down matrices per layer;
-- RMSNorm;
-- RoPE;
+- RMSNorm and RoPE;
 - causal scaled-dot-product attention;
-- an **untied** LM head.
+- untied LM head.
 
-### `sdt`
+### sDT
 
-The New-DT model with the same hidden size, heads, layers, FFN width, RMSNorm,
-RoPE, SwiGLU, causal attention, dropout, and untied LM head. Its embedding,
-attention, FFN, and output values are reconstructed from scalar-neuron routes.
-
-The intended model difference is therefore:
+The sDT model uses the same hidden size, heads, depth, FFN width, RMSNorm, RoPE,
+SwiGLU, causal attention, dropout, and untied output design. Its embedding,
+attention, FFN, and LM values are reconstructed from token-owned scalar routes.
 
 ```text
-shared GPT: one conventional attention/FFN matrix per layer
-sDT:       token-owned scalar-routed attention/FFN matrices
+shared GPT → conventional shared attention/FFN matrices
+sDT       → token-owned scalar-routed attention/FFN matrices
 ```
 
-## Word-space tokenizer
+## Canonical SciQ input
 
-The tokenizer is trained directly from the supplied UTF-8 text files.
-
-```text
-text.split()
-```
-
-It splits only on whitespace. Punctuation remains attached to words, so `model.`
-and `model` are different tokens. The vocabulary is ordered deterministically by
-frequency and then alphabetically. The first IDs are always:
-
-```text
-<pad> <unk> <bos> <eos>
-```
-
-Every non-empty dataset line receives one `<eos>` token.
-
-## Basic run
+Prepare the dataset once:
 
 ```bash
-python compare_small.py \
-  --data dataset.txt \
+pip install -e ".[data]"
+new-dt-prepare-sciq \
+  --output data/sciq \
+  --lowercase \
+  --min-frequency 2
+```
+
+Then train from the saved artifacts:
+
+```bash
+new-dt-compare \
+  --prepared-data data/sciq \
   --model both \
+  --run-name sciq_static \
+  --device cuda \
   --d-model 32 \
   --heads 4 \
   --layers 2 \
   --ffn-dim 128 \
   --seq-len 64 \
   --batch-size 8 \
-  --steps 500 \
+  --steps 1000 \
   --lr 3e-4 \
-  --structure-interval 100
-```
-
-The installed CLI is equivalent:
-
-```bash
-new-dt-compare --data dataset.txt --model both ...
-```
-
-Multiple files may be supplied:
-
-```bash
-python compare_small.py --data part1.txt part2.txt part3.txt --model both
-```
-
-## Strict static-routing comparison
-
-Disable sDT split/merge to measure only the scalar-routed representation:
-
-```bash
-python compare_small.py \
-  --data dataset.txt \
-  --model both \
   --structure-interval 0
 ```
 
-## Dynamic sDT comparison
+`--prepared-data` loads `tokenizer.json` and `pretrain_train_tokens.pt` directly.
+The command does not call `split()`, rebuild vocabulary IDs, or retokenize text.
+Before training, it validates:
 
-Enable structural changes and tune them from the CLI:
+- prepared format/version;
+- vocabulary size;
+- EOS ID;
+- metadata token count;
+- integer dtype and ID range;
+- minimum stream length for the chosen sequence length.
+
+A repository-local `data/sciq` directory is auto-selected when neither
+`--prepared-data` nor `--data` is supplied.
+
+## Static and dynamic comparisons
+
+Static routing isolates the scalar-routed representation:
 
 ```bash
-python compare_small.py \
-  --data dataset.txt \
+new-dt-compare --prepared-data data/sciq --model both --structure-interval 0
+```
+
+Dynamic routing enables split and merge:
+
+```bash
+new-dt-compare \
+  --prepared-data data/sciq \
   --model both \
-  --structure-interval 50 \
+  --structure-interval 100 \
   --min-owner-samples 4 \
-  --min-conflict-score 0.5 \
   --max-splits-per-pass 4 \
   --max-merges-per-pass 4
 ```
@@ -107,57 +94,34 @@ python compare_small.py \
 The current merge index requires zero weight decay. With nonzero weight decay,
 pass `--no-merge`.
 
-## Recommended first configuration
+## Raw custom text
+
+Raw text remains available for unrelated experiments:
 
 ```bash
-python compare_small.py \
-  --data dataset.txt \
-  --model both \
-  --run-name first_test \
-  --device cuda \
-  --d-model 32 \
-  --heads 4 \
-  --layers 2 \
-  --ffn-dim 128 \
-  --seq-len 64 \
-  --dropout 0 \
-  --steps 1000 \
-  --batch-size 8 \
-  --grad-accum 1 \
-  --lr 3e-4 \
-  --warmup-steps 50 \
-  --eval-interval 50 \
-  --eval-batches 20 \
-  --initial-shared-fraction 0.5 \
-  --route-page-size 256 \
-  --route-templates-per-page 4 \
-  --structure-interval 100
+new-dt-compare --data part1.txt part2.txt --model both
 ```
 
-Keeping dropout at zero makes the comparison easier to reproduce because the two
-architectures consume random numbers differently internally.
+That mode deliberately trains a new whitespace tokenizer. It is mutually exclusive
+with `--prepared-data`.
 
 ## Fairness controls
 
-For `--model both`, the runner resets the seed before constructing each model and
-reuses the same tensors containing every train and validation start position.
-Both models therefore receive:
+For `--model both`, the runner resets the seed before each model and reuses the
+same precomputed batch plan. Both models receive:
 
-- the same tokenizer and vocabulary;
-- the same train/validation token split;
-- the same sequence length and batches in the same order;
-- the same AdamW hyperparameters and cosine schedule;
-- the same gradient accumulation and clipping;
-- the same RMSNorm, RoPE, SwiGLU, causal attention, and untied output design.
+- identical tokenizer IDs;
+- identical train/validation token streams;
+- identical sequence length and batch order;
+- identical AdamW settings and cosine schedule;
+- identical gradient accumulation and clipping;
+- identical RMSNorm, RoPE, SwiGLU, causal attention, and untied-output topology.
 
-The models are intentionally **not parameter-count matched**. The report includes
-normal parameter count, sDT active scalar count, effective active parameters,
-logical route references, and estimated packed route storage so quality can be
-interpreted together with capacity and cost.
+The models are not artificially parameter-count matched. Reports include normal
+parameter count, sDT active scalar count, effective active parameters, logical
+route references, estimated packed route storage, throughput, and perplexity.
 
 ## Output
-
-Each run creates:
 
 ```text
 runs/small_comparison/<run>/
@@ -174,14 +138,6 @@ runs/small_comparison/<run>/
     └── checkpoint.pt
 ```
 
-Use `--no-save-checkpoint` for metric-only experiments. Use `--export-routing` to
-write packed `.sprc` route containers for the final sDT model.
-
-The terminal comparison reports:
-
-- final and best validation perplexity;
-- training tokens per second;
-- trainable parameters;
-- sDT effective active parameters;
-- estimated packed route storage;
-- split and merge counts in the JSON summary.
+`run_config.json` records whether the source was `prepared` or `raw_text` and the
+exact tokenizer/token-stream paths. Use `--no-save-checkpoint` for metric-only
+experiments and `--export-routing` to save final packed sDT routes.

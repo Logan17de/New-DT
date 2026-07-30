@@ -26,7 +26,7 @@ Shared residual stream
     ▼
 Shared final RMSNorm
     │
-    └── SPRC routes → LM scalar pool
+    └── SPRC routes → untied LM scalar pool
         ▼
       logits
 ```
@@ -37,7 +37,7 @@ RoPE remain shared communication mechanics.
 
 ## Selective Page Reconstruction Compression
 
-Dense `vocab_size × route_size` route tensors have been replaced by SPRC:
+Dense `vocab_size × route_size` route tensors are replaced by SPRC:
 
 ```text
 token + page
@@ -51,79 +51,28 @@ token + page
 Pages are storage and selective-decoding units only. Scalar sharing still occurs
 at arbitrary individual route slots.
 
-### Split
+### Structural updates
 
-A split clones the source scalar and its Adam moments, then writes one exception:
-
-```text
-Template 7: offset 18 → neuron 75
-Token 42 exception: offset 18 → neuron 901
-```
-
-The template never changes.
-
-### Delta and template promotion
-
-- Small unique changes remain exceptions.
-- The same full patch reused by multiple token pages becomes one shared delta.
-- A large patch is resolved once and absorbed into a new immutable template.
-- Merges remove or rewrite patches and may make old templates unused.
-
-### Exact reverse ownership
-
-SPRC avoids a dense second copy of every relation edge. Exact owners are derived
-from scalar-to-template references, compact selectors, and sparse deviations.
-Template-user lists are built lazily and cached only when split/merge needs them.
+- A split clones one scalar and writes an exact route exception.
+- Reused complete patches become shared deltas.
+- Large patches are promoted to immutable templates.
+- Merges rewrite only exact owners and can make old templates reclaimable.
+- Reverse owners are derived from template references, compact selectors, and
+  sparse deviations instead of a dense second edge table.
 
 ### Optimized execution
 
-- Per-token selector defaults replace the dense vocabulary-by-page selector tensor.
-- Sparse page selector divergence promotes to a dense page only when worthwhile.
-- Immutable template+delta pages use an LRU cache.
-- Batch tokens are grouped by page recipe and decoded once per group.
-- Q/K/V/O and FFN matrices are reconstructed in output-row tiles.
-- The LM head is reconstructed in vocabulary tiles.
-- Route gradients retain their exact original slots across every tile.
-- RoPE cosine/sine tensors are cached by sequence length, device, and dtype.
+- Adaptive per-token/page selectors
+- Immutable template/delta LRU cache
+- Grouped batch page reconstruction
+- Tiled Q/K/V/O and FFN reconstruction
+- Tiled untied LM-head reconstruction
+- Exact route-slot gradient capture across tiles
+- Packed arbitrary-width integer containers
+- Memory-mapped selective page reads
+- Cached RoPE cosine/sine tensors
 
-### Packed files and selective reads
-
-```python
-routed.export_packed("embedding.sprc")
-
-from new_dt import PackedSPRCReader
-with PackedSPRCReader("embedding.sprc") as reader:
-    page = reader.resolve_page(token_id=732, page_id=18, device="cuda")
-```
-
-The packed container uses arbitrary-width exact integer IDs, independent template,
-delta, and recipe indexes, atomic replacement, payload checksums, and memory-mapped
-page reads. `DynamicTransformer.export_routing(directory)` exports every routed
-pool plus a manifest.
-
-See [docs/SPRC.md](docs/SPRC.md) for the complete storage/runtime design.
-
-## RoPE
-
-New-DT stores no learned or sinusoidal additive position table. Rotary position
-embedding is applied directly to Q and K in every attention layer.
-
-## Adam and structural updates
-
-Recommended order:
-
-```text
-micro-batch forward/backward
-capture exact route-slot gradient evidence
-repeat until gradient accumulation completes
-Adam step
-periodic split/merge pass
-route compaction when useful
-zero gradients
-```
-
-Use `torch.optim.Adam`, or AdamW with `weight_decay=0`, for the current incremental
-merge-value index.
+See [docs/SPRC.md](docs/SPRC.md) for the complete design.
 
 ## Install and test
 
@@ -141,11 +90,10 @@ python train_demo.py --steps 20 --grad-accum 2
 python benchmarks/benchmark_sprc.py
 ```
 
-## Prepare SciQ and the word-space tokenizer
+## Prepare SciQ once
 
-Download the science corpus, create a support-only pretraining file, train the
-word-space tokenizer from SciQ train text, and save token IDs plus held-out QA
-files:
+The preparation command downloads SciQ, trains the word-space tokenizer from the
+training split only, and writes the exact pre-tokenized support corpus:
 
 ```bash
 pip install -e ".[data]"
@@ -155,57 +103,90 @@ new-dt-prepare-sciq \
   --min-frequency 2
 ```
 
-The root command is equivalent:
+Generated canonical inputs include:
 
-```bash
-python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2
+```text
+data/sciq/
+├── tokenizer.json
+├── pretrain_train_tokens.pt
+├── metadata.json
+├── qa_train.jsonl
+├── qa_validation.jsonl
+└── qa_test.jsonl
 ```
 
-See [docs/SCIQ_PREPARATION.md](docs/SCIQ_PREPARATION.md) for the generated files,
-data-separation policy, and Colab workflow.
+See [docs/SCIQ_PREPARATION.md](docs/SCIQ_PREPARATION.md).
 
 ## Small GPT versus sDT comparison
 
-Train a conventional shared-matrix GPT and sDT on the same dataset-derived
-word-space vocabulary and the exact same precomputed batches:
+Use the **saved tokenizer and saved token IDs directly**:
 
 ```bash
 python compare_small.py \
-  --data dataset.txt \
+  --prepared-data data/sciq \
   --model both \
+  --run-name sciq_static \
+  --device cuda \
   --d-model 32 \
   --heads 4 \
   --layers 2 \
   --ffn-dim 128 \
   --seq-len 64 \
-  --steps 500 \
-  --batch-size 8
+  --steps 1000 \
+  --batch-size 8 \
+  --structure-interval 0
 ```
 
-The installed command is also available:
+The installed command is equivalent:
 
 ```bash
-new-dt-compare --data dataset.txt --model both ...
+new-dt-compare --prepared-data data/sciq --model both ...
 ```
 
-Both models use RMSNorm, RoPE, SwiGLU, causal attention, bias-free projections,
-identical optimizer settings, and **untied** embedding/LM-head storage. The GPT
-uses conventional shared Q/K/V/O and FFN matrices; sDT uses token-owned scalar
-routes. Set `--structure-interval 0` for a static-routing ablation or use a positive
-interval to enable split/merge.
+When `data/sciq` exists, `--prepared-data` may be omitted. The runner then selects
+that directory automatically. It verifies the tokenizer vocabulary size, EOS ID,
+token count, integer range, metadata, and token-stream format before constructing
+either model. It does **not** rebuild or retokenize the corpus.
 
-See [docs/SMALL_COMPARISON.md](docs/SMALL_COMPARISON.md) for all CLI controls,
-fairness rules, output files, and recommended starting configurations.
+For a dynamic sDT run:
+
+```bash
+new-dt-compare \
+  --prepared-data data/sciq \
+  --model both \
+  --run-name sciq_dynamic \
+  --d-model 32 \
+  --heads 4 \
+  --layers 2 \
+  --ffn-dim 128 \
+  --seq-len 64 \
+  --steps 1000 \
+  --structure-interval 100
+```
+
+Raw custom text remains supported with `--data file1.txt file2.txt`; that mode
+intentionally trains a new tokenizer. `--data` and `--prepared-data` cannot be used
+together.
+
+Both comparison models use the same:
+
+- exact tokenizer IDs and precomputed token stream;
+- train/validation split and batch-start plan;
+- RMSNorm, RoPE, SwiGLU, causal attention, depth, width, and dropout;
+- AdamW settings, LR schedule, accumulation, and clipping;
+- untied embedding and LM-head storage.
+
+The intended difference is conventional shared Q/K/V/O and FFN matrices versus
+sDT token-owned scalar-routed matrices.
+
+See [docs/SMALL_COMPARISON.md](docs/SMALL_COMPARISON.md) for all controls and
+output files.
 
 ## Minimal usage
 
 ```python
 import torch
-from new_dt import (
-    DynamicStructureController,
-    DynamicTransformer,
-    DynamicTransformerConfig,
-)
+from new_dt import DynamicStructureController, DynamicTransformer, DynamicTransformerConfig
 
 config = DynamicTransformerConfig(
     vocab_size=32,
@@ -215,8 +196,6 @@ config = DynamicTransformerConfig(
     ffn_dim=16,
     route_page_size=1024,
     route_templates_per_page=16,
-    route_linear_out_tile=64,
-    route_lm_head_tile=1024,
 )
 model = DynamicTransformer(config)
 optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
@@ -224,23 +203,17 @@ controller = DynamicStructureController(structure_interval=100)
 
 input_ids = torch.randint(0, config.vocab_size, (2, 12))
 output = model(input_ids, labels=input_ids, collect_route_grads=True)
-assert output.loss is not None
 output.loss.backward()
 controller.collect(model)
 optimizer.step()
 controller.maybe_restructure(model, optimizer, optimizer_step=1)
 optimizer.zero_grad(set_to_none=True)
-
-print(model.pool_summary())
-print(model.routing_storage_summary())
 ```
 
 ## Implementation status
 
-The repository implements exact SPRC split/merge semantics, adaptive selectors,
-immutable templates, shared deltas, exceptions, compaction, exact reverse queries,
-packed on-disk containers, mmap selective reads, route caches, tiled execution,
-RoPE, storage telemetry, benchmark coverage, a matched small-GPT comparison runner,
-and SciQ word-space data preparation. Native fused CUDA decoding and distributed
-route sharding remain optional future backends; the current tiled PyTorch path is
-exact and works on CPU or GPU.
+The repository implements exact SPRC semantics, adaptive selectors, immutable
+templates, shared deltas, exceptions, compaction, reverse queries, packed storage,
+mmap selective reads, tiled execution, RoPE, split/merge integration, a matched
+small-GPT baseline, SciQ preparation, and exact prepared-token training. Native
+fused CUDA decoding and distributed route sharding remain optional future backends.
