@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "new-dt"
-version = "0.3.0"
-description = "Scalar-neuron Dynamic Transformer with SPRC route storage"
+version = "0.4.0"
+description = "Dynamic Transformer research models with direct lookup and SPRC backends"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.2", "numpy>=1.26"]
@@ -15,7 +15,7 @@ dev = ["pytest>=8.0"]
 data = ["datasets>=3.0"]
 
 [project.scripts]
-new-dt-compare = "new_dt.training_cli:main"
+new-dt-compare = "new_dt.lookup_training_cli:main"
 new-dt-prepare-sciq = "new_dt.prepare_sciq:main"
 
 [tool.pytest.ini_options]
