@@ -4,6 +4,7 @@ import base64
 import gzip
 import io
 import json
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from new_dt.word_tokenizer import WordSpaceTokenizer
 
 
 def _write_prepared_data(root: Path, *, packed: bool) -> tuple[WordSpaceTokenizer, torch.Tensor]:
+    root.mkdir(parents=True, exist_ok=True)
     text = "alpha beta gamma delta epsilon zeta eta theta"
     tokenizer = WordSpaceTokenizer.train(text, lowercase=True, min_frequency=1)
     tokenizer.save(root / "tokenizer.json")
@@ -71,6 +73,26 @@ def test_prepared_loader_preserves_exact_token_ids(tmp_path: Path, packed: bool)
     assert corpus.validation_tokens.dtype == torch.long
 
 
+def test_prepared_loader_reads_top_level_folder_inside_zip(tmp_path: Path) -> None:
+    prepared = tmp_path / "prepared" / "sciq"
+    tokenizer, original = _write_prepared_data(prepared, packed=False)
+    archive_path = tmp_path / "sciq.zip"
+
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in prepared.iterdir():
+            archive.write(path, arcname=f"sciq/{path.name}")
+
+    corpus = load_prepared_corpus(
+        archive_path,
+        validation_fraction=0.2,
+        seq_len=8,
+    )
+    reconstructed = torch.cat((corpus.train_tokens, corpus.validation_tokens))
+
+    assert corpus.tokenizer.tokens == tokenizer.tokens
+    assert torch.equal(reconstructed, original)
+
+
 def test_prepared_loader_rejects_tokenizer_mismatch(tmp_path: Path) -> None:
     tokenizer, _ = _write_prepared_data(tmp_path, packed=False)
     payload = torch.load(tmp_path / TOKEN_FILE, weights_only=False)
@@ -81,7 +103,10 @@ def test_prepared_loader_rejects_tokenizer_mismatch(tmp_path: Path) -> None:
         load_prepared_corpus(tmp_path, validation_fraction=0.2, seq_len=8)
 
 
-def test_comparison_parser_accepts_prepared_data_without_raw_text() -> None:
-    args = build_parser().parse_args(["--prepared-data", "data/sciq"])
+def test_comparison_parser_accepts_prepared_zip_and_dt_name() -> None:
+    args = build_parser().parse_args(
+        ["--prepared-data", "data/sciq.zip", "--model", "dt"]
+    )
     assert args.data is None
-    assert args.prepared_data == Path("data/sciq")
+    assert args.prepared_data == Path("data/sciq.zip")
+    assert args.model == "dt"
