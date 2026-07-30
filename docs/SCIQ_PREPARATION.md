@@ -28,9 +28,7 @@ python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2
 Use `--force` to replace files in an existing output directory. `--max-vocab N`
 limits the vocabulary including `<pad>`, `<unk>`, `<bos>`, and `<eos>`.
 
-## Complete Google Colab block
-
-Run this in one Colab code cell:
+## Complete Google Colab preparation
 
 ```bash
 !rm -rf /content/New-DT
@@ -46,15 +44,6 @@ Run this in one Colab code cell:
 !ls -lh /content/New-DT/data/sciq
 ```
 
-For later Colab sessions where the repository folder already exists:
-
-```bash
-%cd /content/New-DT
-!git pull origin main
-!pip install -q -e ".[data]"
-!python prepare_sciq.py --output data/sciq --lowercase --min-frequency 2 --force
-```
-
 ## Data separation
 
 Tokenizer vocabulary training uses these fields from SciQ train only:
@@ -68,9 +57,9 @@ distractor2
 distractor3
 ```
 
-The LM pretraining text contains only unique non-empty `support` passages from the
-train split. Questions and answers are intentionally excluded from that corpus so
-the later QA test is not silently converted into memorization training.
+The LM pretraining stream contains only unique non-empty `support` passages from
+the train split. Questions and answers are excluded from LM pretraining so held-out
+QA does not become silent memorization training.
 
 ## Output
 
@@ -87,32 +76,35 @@ data/sciq/
 └── metadata.json
 ```
 
-`pretrain_train_tokens.pt` contains an `int32` token stream and tokenizer metadata.
-`metadata.json` records corpus hashes, byte/token counts, split sizes, and OOV rates
-for all three QA splits.
+`pretrain_train_tokens.pt` contains the exact `int32` token stream.
+`metadata.json` records corpus hashes, byte/token counts, split sizes, and OOV rates.
 
-## Use in the small comparison
-
-For an immediate architecture-only language-model comparison, pass the generated
-support corpus to both models:
+## Train from the saved tokenizer and token IDs
 
 ```bash
 new-dt-compare \
-  --data data/sciq/pretrain_train.txt \
+  --prepared-data data/sciq \
   --model both \
-  --lowercase \
-  --min-frequency 2 \
+  --run-name sciq_static \
+  --device cuda \
   --d-model 32 \
   --heads 4 \
   --layers 2 \
   --ffn-dim 128 \
   --seq-len 64 \
-  --steps 1000
+  --steps 1000 \
+  --batch-size 8 \
+  --structure-interval 0
 ```
 
-That command rebuilds a support-only vocabulary, but it remains a fair GPT-versus-
-sDT comparison because both models receive exactly the same tokenizer and batches.
-It will not have identical IDs to `tokenizer.json`, whose vocabulary also covers
-train questions and answers. Preserve `tokenizer.json` and
-`pretrain_train_tokens.pt` as the canonical artifacts for the later pretraining-plus-
-QA workflow.
+The comparison loader reads `tokenizer.json` and `pretrain_train_tokens.pt`
+directly. It does not rebuild the tokenizer from `pretrain_train.txt`. The saved
+vocabulary therefore remains exactly the canonical SciQ vocabulary used for later
+QA evaluation.
+
+The loader verifies format/version, vocabulary size, EOS ID, token count, dtype,
+and ID range before training. Both GPT and sDT receive the same loaded tensor and
+the same deterministic train/validation split.
+
+A compact repository-safe archive named `pretrain_train_tokens.pt.gz.b64` is also
+supported. It is decoded in memory and must contain the same PyTorch payload.
