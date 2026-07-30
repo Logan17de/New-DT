@@ -66,9 +66,8 @@ def test_prepare_sciq_writes_reusable_tokenizer_and_stream(tmp_path: Path) -> No
 
     assert metadata["splits"] == {"train": 3, "validation": 1, "test": 1}
     assert metadata["pretraining_corpus"]["paragraphs"] == 2
-    assert (tmp_path / "pretrain_train.txt").read_text(encoding="utf-8").count(
-        "water freezes"
-    ) == 1
+    corpus_text = (tmp_path / "pretrain_train.txt").read_text(encoding="utf-8")
+    assert corpus_text.lower().count("water freezes") == 1
 
     tokenizer = WordSpaceTokenizer.load(tmp_path / "tokenizer.json")
     assert tokenizer.lowercase
