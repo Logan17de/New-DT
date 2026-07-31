@@ -1,5 +1,5 @@
 model,best_validation_ppl,best_step,overfit_onset,final_validation_ppl,parameters,notes
-shared_gpt,333.474,19300,19350,473.546,1724768,"shared Attention and FFN; final PPL shown from matched run record where available"
+shared_gpt,333.474,19300,19350,,1724768,"shared Attention and FFN; final PPL was not captured in the consolidated screenshot"
 shared_attn_unique_ffn,343.010,25500,26950,,489527648,"best non-MOD lookup baseline"
 shared_attn_unique_ffn_gate_mod4,342.835,21550,21800,348.780,489633512,"direct MOD-4 added to Gate before SiLU"
 shared_attn_unique_ffn_gate_mod8,342.6633,21550,21800,348.0033,489739376,"direct MOD-8 added to Gate before SiLU"
