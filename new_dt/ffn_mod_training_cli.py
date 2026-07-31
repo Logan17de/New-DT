@@ -24,11 +24,15 @@ from .training_cli import (
 )
 
 
+LOG_NAME = "unique_attn_shared_ffn_post_activation_mod"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = common.build_parser()
     parser.description = (
-        "Train unique token attention with a shared SwiGLU FFN plus small "
-        "token-specific low-rank FFN modifiers."
+        "Train token-unique attention with a shared SwiGLU FFN and the user's "
+        "small token MOD: one token vector is projected by a layer-shared matrix, "
+        "added after SwiGLU activation, and then passed through the shared down projection."
     )
     actions = {action.dest: action for action in parser._actions}
     actions["data"].required = False
@@ -45,8 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory or ZIP containing tokenizer.json and prepared tokens.",
     )
-    parser.add_argument("--ffn-mod-dim", type=int, default=4)
-    parser.add_argument("--ffn-mod-scale", type=float, default=1.0)
+    parser.add_argument(
+        "--ffn-mod-dim",
+        type=int,
+        default=4,
+        help="Size of each token-owned MOD vector per layer.",
+    )
+    parser.add_argument(
+        "--ffn-mod-scale",
+        type=float,
+        default=1.0,
+        help="Scale applied after the common MOD projection.",
+    )
     parser.add_argument("--max-parameters", type=int, default=300_000_000)
     parser.add_argument("--allow-large-model", action="store_true")
     return parser
@@ -58,14 +72,22 @@ def _build_config(args: argparse.Namespace, vocab_size: int) -> DynamicTransform
     return config
 
 
-def _parameter_estimate(config: DynamicTransformerConfig, rank: int) -> int:
+def _parameter_estimate(config: DynamicTransformerConfig, mod_dim: int) -> int:
     v, d, f, l = config.vocab_size, config.d_model, config.ffn_dim, config.n_layers
     embedding_head = 2 * v * d
     norms = l * 2 * d + d
     unique_attention = l * v * 4 * d * d
     shared_ffn = l * 3 * d * f
-    token_mod = l * v * 3 * rank * (d + f)
-    return int(embedding_head + norms + unique_attention + shared_ffn + token_mod)
+    token_mod_vectors = l * v * mod_dim
+    common_mod_projections = l * mod_dim * f
+    return int(
+        embedding_head
+        + norms
+        + unique_attention
+        + shared_ffn
+        + token_mod_vectors
+        + common_mod_projections
+    )
 
 
 def _load_corpus(parser: argparse.ArgumentParser, args: argparse.Namespace):
@@ -118,9 +140,25 @@ def main(argv: list[str] | None = None) -> int:
     estimate = _parameter_estimate(config, args.ffn_mod_dim)
     if estimate > args.max_parameters and not args.allow_large_model:
         parser.error(
-            f"model estimate {estimate:,} exceeds --max-parameters; reduce rank, "
+            f"model estimate {estimate:,} exceeds --max-parameters; reduce MOD dim, "
             "width, FFN, or depth, or pass --allow-large-model"
         )
+
+    token_mod_parameters = (
+        config.n_layers * config.vocab_size * args.ffn_mod_dim
+    )
+    common_projection_parameters = (
+        config.n_layers * args.ffn_mod_dim * config.ffn_dim
+    )
+    print(
+        f"model estimate: {estimate:,} parameters; token MOD table="
+        f"{token_mod_parameters:,}; common MOD projection="
+        f"{common_projection_parameters:,}"
+    )
+    print(
+        "FFN MOD flow: SwiGLU activation + shared_projection(token_mod[token]) "
+        "-> shared down projection"
+    )
 
     plan = common.make_batch_plan(
         corpus,
@@ -139,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     common._set_seed(args.seed)
     model = UniqueAttentionSharedFFNMod(
         config,
-        mod_rank=args.ffn_mod_dim,
+        mod_dim=args.ffn_mod_dim,
         mod_scale=args.ffn_mod_scale,
     ).to(device)
     sparse = list(model.sparse_parameters())
@@ -167,7 +205,12 @@ def main(argv: list[str] | None = None) -> int:
                 "model_config": asdict(config),
                 "source": source,
                 "parameter_estimate": estimate,
-                "architecture": "unique attention + shared FFN + token low-rank MOD",
+                "token_mod_parameters": token_mod_parameters,
+                "common_mod_projection_parameters": common_projection_parameters,
+                "architecture": (
+                    "unique attention + shared FFN + token vector projected by a "
+                    "common matrix after activation and before the down projection"
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -188,8 +231,13 @@ def main(argv: list[str] | None = None) -> int:
         seq_len=config.max_seq_len,
         device=device,
     )
-    print(f"[unique_attn_shared_ffn_mod] step=0 val_loss={initial_loss:.4f} val_ppl={initial_ppl:.3f}")
-    record({"step": 0, "validation_loss": initial_loss, "validation_ppl": initial_ppl})
+    print(
+        f"[{LOG_NAME}] step=0 val_loss={initial_loss:.4f} "
+        f"val_ppl={initial_ppl:.3f}"
+    )
+    record(
+        {"step": 0, "validation_loss": initial_loss, "validation_ppl": initial_ppl}
+    )
     best_loss, best_step = initial_loss, 0
     processed, seconds, final_train = 0, 0.0, float("nan")
     optimizers.zero_grad()
@@ -215,7 +263,8 @@ def main(argv: list[str] | None = None) -> int:
                 device,
             )
             output = model(batch, labels=batch)
-            assert output.loss is not None
+            if output.loss is None:
+                raise RuntimeError("model did not return a training loss")
             (output.loss / args.grad_accum).backward()
             losses.append(float(output.loss.detach().cpu()))
         sparse_norm = _clip_gradients(sparse, args.grad_clip)
@@ -230,13 +279,20 @@ def main(argv: list[str] | None = None) -> int:
         if step % args.log_interval == 0 or step == 1:
             rate = processed / max(seconds, 1e-9)
             print(
-                f"[unique_attn_shared_ffn_mod] step={step} train_loss={final_train:.4f} "
+                f"[{LOG_NAME}] step={step} train_loss={final_train:.4f} "
                 f"lr={lr:.3e} tok/s={rate:.1f} sparse_grad={sparse_norm:.3f} "
                 f"dense_grad={dense_norm:.3f}"
             )
-            record({"step": step, "train_loss": final_train, "learning_rate": lr,
-                    "tokens_per_second": rate, "sparse_gradient_norm": sparse_norm,
-                    "dense_gradient_norm": dense_norm})
+            record(
+                {
+                    "step": step,
+                    "train_loss": final_train,
+                    "learning_rate": lr,
+                    "tokens_per_second": rate,
+                    "sparse_gradient_norm": sparse_norm,
+                    "dense_gradient_norm": dense_norm,
+                }
+            )
         if step % args.eval_interval == 0 or step == args.steps:
             val_loss, val_ppl = common.evaluate(
                 model,
@@ -247,8 +303,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             if val_loss < best_loss:
                 best_loss, best_step = val_loss, step
-            print(f"[unique_attn_shared_ffn_mod] step={step} val_loss={val_loss:.4f} val_ppl={val_ppl:.3f}")
-            record({"step": step, "validation_loss": val_loss, "validation_ppl": val_ppl})
+            print(
+                f"[{LOG_NAME}] step={step} val_loss={val_loss:.4f} "
+                f"val_ppl={val_ppl:.3f}"
+            )
+            record(
+                {
+                    "step": step,
+                    "validation_loss": val_loss,
+                    "validation_ppl": val_ppl,
+                }
+            )
 
     final_loss, final_ppl = common.evaluate(
         model,
@@ -258,8 +323,8 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
     )
     summary = {
-        "model": "unique_attn_shared_ffn_mod",
-        "mod_rank": args.ffn_mod_dim,
+        "model": LOG_NAME,
+        "mod_dim": args.ffn_mod_dim,
         "mod_scale": args.ffn_mod_scale,
         "best_step": best_step,
         "best_validation_loss": best_loss,
@@ -270,7 +335,9 @@ def main(argv: list[str] | None = None) -> int:
         "processed_target_tokens": processed,
         "tokens_per_second": processed / max(seconds, 1e-9),
         "total_parameters": sum(p.numel() for p in model.parameters()),
-        "parameter_bytes": sum(p.numel() * p.element_size() for p in model.parameters()),
+        "parameter_bytes": sum(
+            p.numel() * p.element_size() for p in model.parameters()
+        ),
         **model.lookup_summary(),
     }
     (run_dir / "summary.json").write_text(
@@ -281,7 +348,7 @@ def main(argv: list[str] | None = None) -> int:
             {"model": model.state_dict(), "config": asdict(config), "summary": summary},
             run_dir / "checkpoint.pt",
         )
-    print("\nFinal FFN MOD result")
+    print("\nFinal projected post-activation FFN MOD result")
     print(
         f"val_ppl={final_ppl:.3f} best_ppl={summary['best_validation_ppl']:.3f} "
         f"best_step={best_step:,} parameters={summary['total_parameters']:,}"
