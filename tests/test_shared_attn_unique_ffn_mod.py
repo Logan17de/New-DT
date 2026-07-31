@@ -67,7 +67,7 @@ def test_sparse_gradients_cover_active_mod_and_unique_ffn_rows() -> None:
 
     sparse = list(model.sparse_parameters())
     assert sparse
-    assert model.token_mod.weight in sparse
+    assert any(parameter is model.token_mod.weight for parameter in sparse)
     assert all(parameter.grad is not None for parameter in sparse)
     assert all(parameter.grad.is_sparse for parameter in sparse)
 
@@ -89,7 +89,6 @@ def test_parameter_and_training_state_estimates_match_model() -> None:
 
 def test_mod_parameters_are_only_small_table_plus_layer_projections() -> None:
     cfg = config()
-    baseline = _model_parameter_count(cfg, 0) if False else None
     base_model = SharedAttentionUniqueFFN(cfg)
     mod_model = SharedAttentionUniqueFFNMod(cfg, mod_dim=2)
     added = sum(parameter.numel() for parameter in mod_model.parameters()) - sum(
