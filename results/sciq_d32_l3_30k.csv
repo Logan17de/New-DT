@@ -1,0 +1,11 @@
+model,best_validation_ppl,best_step,overfit_onset,final_validation_ppl,parameters,notes
+shared_gpt,333.474,19300,19350,473.546,1724768,"shared Attention and FFN; final PPL shown from matched run record where available"
+shared_attn_unique_ffn,343.010,25500,26950,,489527648,"best non-MOD lookup baseline"
+shared_attn_unique_ffn_gate_mod4,342.835,21550,21800,348.780,489633512,"direct MOD-4 added to Gate before SiLU"
+shared_attn_unique_ffn_gate_mod8,342.6633,21550,21800,348.0033,489739376,"direct MOD-8 added to Gate before SiLU"
+shared_attn_unique_ffn_branch_mod4,343.147,21500,21800,,489633512,"direct MOD-4 added to Up/branch before multiplication"
+shared_attn_unique_ffn_post_mod4,343.888,23150,23650,348.630,489633512,"direct MOD-4 added after SwiGLU activation"
+shared_attn_attn_mod4_unique_ffn,345.222,21500,21750,,489633896,"projected token Attention MOD-4"
+unique_attn_shared_ffn,420.224,6250,6650,,326926688,"three-layer controlled benchmark"
+unique_attn_shared_ffn_projected_ffn_mod4,420.496,6700,8500,,327033320,"projected post-activation FFN MOD-4"
+fully_unique_attn_ffn,481.663,6800,7700,,814729568,"fully token-unique Attention and FFN"
