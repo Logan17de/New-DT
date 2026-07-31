@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterator
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -20,20 +19,18 @@ class UniqueAttentionFFNModOutput:
 
 
 class PostActivationTokenModifier(nn.Module):
-    """Project a small token-owned vector into the shared FFN activation width.
+    """Project a shared-across-layers token MOD vector into one layer's FFN width.
 
-    Every token owns exactly one ``mod_dim`` vector per layer. One projection matrix
-    is shared by every token in that layer:
+    Every vocabulary token owns one small vector in the model-level MOD table.
+    Every Transformer layer owns a different projection matrix. The same token
+    vector is therefore reused across depth, while each layer can interpret it
+    differently:
 
-        projected_mod(token) = P_shared @ mod[token]
-
-    Token vectors start at zero, so the modifier has exactly zero effect at model
-    initialization. The shared projection starts random and is trained jointly.
+        projected_mod(token, layer) = P_layer(mod_table[token])
     """
 
     def __init__(
         self,
-        vocab_size: int,
         mod_dim: int,
         out_features: int,
         *,
@@ -43,25 +40,19 @@ class PostActivationTokenModifier(nn.Module):
         super().__init__()
         if mod_dim <= 0:
             raise ValueError("modifier dimension must be positive")
-        self.vocab_size = int(vocab_size)
         self.mod_dim = int(mod_dim)
         self.out_features = int(out_features)
         self.scale = float(scale)
-
-        self.token_mod = nn.Embedding(vocab_size, mod_dim, sparse=True)
-        nn.init.zeros_(self.token_mod.weight)
         self.projection = SharedLinear(
             mod_dim,
             out_features,
             init_std=init_std,
         )
 
-    def forward(self, token_ids: Tensor) -> Tensor:
-        return self.scale * self.projection(self.token_mod(token_ids))
-
-    @property
-    def parameters_per_token(self) -> int:
-        return self.mod_dim
+    def forward(self, token_mod_vectors: Tensor) -> Tensor:
+        if token_mod_vectors.shape[-1] != self.mod_dim:
+            raise ValueError("token MOD vectors have the wrong final dimension")
+        return self.scale * self.projection(token_mod_vectors)
 
     @property
     def shared_projection_parameters(self) -> int:
@@ -69,18 +60,18 @@ class PostActivationTokenModifier(nn.Module):
 
 
 class SharedFFNWithPostActivationTokenMod(nn.Module):
-    """Shared SwiGLU FFN with the user's token MOD after activation.
+    """Shared SwiGLU FFN with projected token MOD after activation.
 
     Flow:
 
         up = W_up x
         gate = W_gate x
         activated = SiLU(gate) * up
-        activated = activated + P_shared(mod[token])
+        activated = activated + P_layer(mod_table[token])
         output = W_down activated
 
-    The down projection therefore performs the normal FFN shrink only after the
-    token-specific modifier has been added in FFN activation space.
+    The MOD table is owned by the complete model and shared across all layers.
+    This module owns only the layer-specific expansion projection.
     """
 
     def __init__(
@@ -102,7 +93,6 @@ class SharedFFNWithPostActivationTokenMod(nn.Module):
             init_std=config.init_std,
         )
         self.modifier = PostActivationTokenModifier(
-            config.vocab_size,
             mod_dim,
             config.ffn_dim,
             init_std=config.init_std,
@@ -114,9 +104,9 @@ class SharedFFNWithPostActivationTokenMod(nn.Module):
             init_std=config.init_std,
         )
 
-    def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
+    def forward(self, x: Tensor, token_mod_vectors: Tensor) -> Tensor:
         activated = F.silu(self.gate_proj(x)) * self.up_proj(x)
-        activated = activated + self.modifier(token_ids)
+        activated = activated + self.modifier(token_mod_vectors)
         return self.down_proj(activated)
 
 
@@ -139,13 +129,20 @@ class UniqueAttentionFFNModBlock(nn.Module):
         )
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
+    def forward(
+        self,
+        x: Tensor,
+        token_ids: Tensor,
+        token_mod_vectors: Tensor,
+    ) -> Tensor:
         x = x + self.dropout(self.attention(self.attention_norm(x), token_ids))
-        return x + self.dropout(self.ffn(self.ffn_norm(x), token_ids))
+        return x + self.dropout(
+            self.ffn(self.ffn_norm(x), token_mod_vectors)
+        )
 
 
 class UniqueAttentionSharedFFNMod(nn.Module):
-    """Unique attention plus shared FFN with projected post-activation token MOD."""
+    """Unique attention plus shared FFN and one cross-layer token MOD table."""
 
     def __init__(
         self,
@@ -168,6 +165,16 @@ class UniqueAttentionSharedFFNMod(nn.Module):
             sparse=True,
         )
         nn.init.normal_(self.embedding.weight, mean=0.0, std=config.init_std)
+
+        # One token table is reused by every Transformer layer. This matches the
+        # better-performing cross-layer-shared MOD design from the old experiments.
+        self.token_mod = nn.Embedding(
+            config.vocab_size,
+            self.mod_dim,
+            sparse=True,
+        )
+        nn.init.zeros_(self.token_mod.weight)
+
         self.layers = nn.ModuleList(
             UniqueAttentionFFNModBlock(
                 config,
@@ -189,11 +196,10 @@ class UniqueAttentionSharedFFNMod(nn.Module):
 
     def sparse_parameters(self) -> Iterator[nn.Parameter]:
         yield self.embedding.weight
+        yield self.token_mod.weight
         for module in self.modules():
             if isinstance(module, TokenLookupLinear):
                 yield module.lookup.weight
-            elif isinstance(module, PostActivationTokenModifier):
-                yield module.token_mod.weight
 
     def dense_parameters(self) -> Iterator[nn.Parameter]:
         sparse_ids = {id(parameter) for parameter in self.sparse_parameters()}
@@ -207,11 +213,12 @@ class UniqueAttentionSharedFFNMod(nn.Module):
         attention_per_token = 4 * self.config.d_model * self.config.d_model
         mod_projection_per_layer = self.mod_dim * self.config.ffn_dim
         return {
-            "architecture": "unique_attn_shared_ffn_post_activation_mod",
+            "architecture": "unique_attn_shared_ffn_cross_layer_shared_post_activation_mod",
             "mod_dim": self.mod_dim,
             "mod_scale": self.mod_scale,
+            "ffn_mod_table_sharing": "one_token_table_shared_across_all_layers",
             "unique_attention_parameters_per_token_per_layer": attention_per_token,
-            "ffn_mod_parameters_per_token_per_layer": self.mod_dim,
+            "ffn_mod_parameters_per_token_total": self.mod_dim,
             "ffn_mod_projection_parameters_per_layer": mod_projection_per_layer,
             "lookup_parameters": int(sum(p.numel() for p in sparse)),
             "dense_parameters": int(sum(p.numel() for p in dense)),
@@ -236,8 +243,9 @@ class UniqueAttentionSharedFFNMod(nn.Module):
             raise ValueError("input_ids contain token IDs outside the vocabulary")
 
         x = self.embedding(input_ids)
+        token_mod_vectors = self.token_mod(input_ids)
         for layer in self.layers:
-            x = layer(x, input_ids)
+            x = layer(x, input_ids, token_mod_vectors)
         logits = self.lm_head(self.final_norm(x))
 
         loss = None
