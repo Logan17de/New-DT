@@ -1,14 +1,17 @@
 import torch
 
 from new_dt import DynamicTransformerConfig
-from new_dt.shared_attn_unique_ffn_mod_training_cli import (
+from new_dt.shared_attn_mod_unique_ffn_training_cli import (
     _model_parameter_count,
     _model_training_bytes,
+    _translate_attention_mod_flags,
 )
+from new_dt.small_gpt import SharedSelfAttention
 from new_dt.small_hybrid_dt import SharedAttentionUniqueFFN
-from new_dt.small_shared_attn_unique_ffn_mod import (
-    SharedAttentionUniqueFFNMod,
-    UniqueFFNWithPostActivationTokenMod,
+from new_dt.small_lookup_dt import LookupFFN
+from new_dt.small_shared_attn_mod_unique_ffn import (
+    AttentionTokenModifier,
+    SharedAttentionModUniqueFFN,
 )
 
 
@@ -24,12 +27,12 @@ def config() -> DynamicTransformerConfig:
     )
 
 
-def test_zero_mod_is_exact_paired_baseline_at_step_zero() -> None:
+def test_zero_attention_mod_is_exact_paired_baseline_at_step_zero() -> None:
     cfg = config()
     torch.manual_seed(42)
     baseline = SharedAttentionUniqueFFN(cfg)
     torch.manual_seed(42)
-    modified = SharedAttentionUniqueFFNMod(cfg, mod_dim=2, mod_scale=1.0)
+    modified = SharedAttentionModUniqueFFN(cfg, mod_dim=2, mod_scale=1.0)
 
     tokens = torch.randint(0, cfg.vocab_size, (2, cfg.max_seq_len))
     baseline.eval()
@@ -44,22 +47,27 @@ def test_zero_mod_is_exact_paired_baseline_at_step_zero() -> None:
     assert torch.count_nonzero(modified.token_mod.weight) == 0
 
 
-def test_one_token_mod_table_is_reused_across_all_layers() -> None:
-    model = SharedAttentionUniqueFFNMod(config(), mod_dim=2)
+def test_mod_is_at_attention_and_unique_ffn_remains_unchanged() -> None:
+    model = SharedAttentionModUniqueFFN(config(), mod_dim=2)
     assert model.token_mod.num_embeddings == model.config.vocab_size
     assert model.token_mod.embedding_dim == 2
-    assert sum(
-        isinstance(layer.ffn, UniqueFFNWithPostActivationTokenMod)
-        for layer in model.layers
-    ) == model.config.n_layers
+
+    projection_ids = set()
+    for layer in model.layers:
+        assert isinstance(layer.attention, SharedSelfAttention)
+        assert isinstance(layer.attention_modifier, AttentionTokenModifier)
+        assert isinstance(layer.ffn, LookupFFN)
+        projection_ids.add(id(layer.attention_modifier.projection.weight))
+
+    assert len(projection_ids) == model.config.n_layers
     assert all(
-        not hasattr(layer.ffn, "token_mod")
+        not hasattr(layer.attention_modifier, "token_mod")
         for layer in model.layers
     )
 
 
 def test_sparse_gradients_cover_active_mod_and_unique_ffn_rows() -> None:
-    model = SharedAttentionUniqueFFNMod(config(), mod_dim=2)
+    model = SharedAttentionModUniqueFFN(config(), mod_dim=2)
     tokens = torch.tensor([[1, 2, 1, 3, 4, 2, 5, 6]])
     output = model(tokens, labels=tokens)
     assert output.loss is not None
@@ -78,7 +86,7 @@ def test_sparse_gradients_cover_active_mod_and_unique_ffn_rows() -> None:
 
 def test_parameter_and_training_state_estimates_match_model() -> None:
     cfg = config()
-    model = SharedAttentionUniqueFFNMod(cfg, mod_dim=2)
+    model = SharedAttentionModUniqueFFN(cfg, mod_dim=2)
     actual = sum(parameter.numel() for parameter in model.parameters())
     assert _model_parameter_count(cfg, 2) == actual
 
@@ -87,11 +95,17 @@ def test_parameter_and_training_state_estimates_match_model() -> None:
     assert _model_training_bytes(cfg, 2) == sparse * 12 + dense * 16
 
 
-def test_mod_parameters_are_only_small_table_plus_layer_projections() -> None:
+def test_mod_parameters_are_table_plus_dmodel_projection_per_layer() -> None:
     cfg = config()
     base_model = SharedAttentionUniqueFFN(cfg)
-    mod_model = SharedAttentionUniqueFFNMod(cfg, mod_dim=2)
+    mod_model = SharedAttentionModUniqueFFN(cfg, mod_dim=2)
     added = sum(parameter.numel() for parameter in mod_model.parameters()) - sum(
         parameter.numel() for parameter in base_model.parameters()
     )
-    assert added == cfg.vocab_size * 2 + cfg.n_layers * 2 * cfg.ffn_dim
+    assert added == cfg.vocab_size * 2 + cfg.n_layers * 2 * cfg.d_model
+
+
+def test_attention_mod_cli_flags_are_translated_for_shared_runner() -> None:
+    assert _translate_attention_mod_flags(
+        ["--attn-mod-dim", "4", "--attn-mod-scale=1.0"]
+    ) == ["--ffn-mod-dim", "4", "--ffn-mod-scale=1.0"]

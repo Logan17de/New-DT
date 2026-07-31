@@ -10,16 +10,16 @@ from rich.text import Text
 
 from . import all_models_dashboard_cli as base
 from .config import DynamicTransformerConfig
-from .small_shared_attn_unique_ffn_mod import SharedAttentionUniqueFFNMod
+from .small_shared_attn_mod_unique_ffn import SharedAttentionModUniqueFFN
 
 
-MODEL_NAME = "shared_attn_unique_ffn_mod"
-CLI_NAME = "shared-attn-unique-ffn-mod"
-MODEL_LABEL = "Shared ATTN + unique FFN + MOD"
+MODEL_NAME = "shared_attn_mod_unique_ffn"
+CLI_NAME = "shared-attn-mod-unique-ffn"
+MODEL_LABEL = "Shared ATTN + token ATTN MOD + unique FFN"
 MODEL_ARCHITECTURE = (
-    "shared Q/K/V/O, token-unique SwiGLU Up/Gate/Down, and one "
-    "cross-layer-shared token MOD table with layer-specific post-activation "
-    "projections before each token-unique Down projection"
+    "shared Q/K/V/O attention plus one cross-layer-shared token Attention MOD "
+    "table with layer-specific d_model projections, followed by token-unique "
+    "SwiGLU Up/Gate/Down matrices"
 )
 
 _ORIGINAL_PARAMETER_COUNTS = base.estimate_parameter_counts
@@ -39,7 +39,7 @@ def _model_parameter_count(
     return int(
         baseline
         + config.vocab_size * mod_dim
-        + config.n_layers * mod_dim * config.ffn_dim
+        + config.n_layers * mod_dim * config.d_model
     )
 
 
@@ -65,7 +65,7 @@ def _model_training_bytes(
     )
     dense = (
         head
-        + layers * (shared_attention + mod_dim * ffn)
+        + layers * (shared_attention + mod_dim * width)
         + norms
     )
     return int(sparse * 12 + dense * 16)
@@ -96,7 +96,7 @@ class SingleModelDashboard(_ORIGINAL_DASHBOARD):
             else f"{running.label} · ETA {base._format_duration(running.eta_seconds)}"
         )
         return Text.from_markup(
-            f"[bold]Controlled paired single-model run[/bold]  "
+            f"[bold]Controlled paired Attention-MOD run[/bold]  "
             f"d={self.config.d_model} · layers={self.config.n_layers} · "
             f"heads={self.config.n_heads} · FFN={self.config.ffn_dim} · "
             f"steps={self.args.steps:,}\n"
@@ -140,7 +140,7 @@ def _install_model() -> None:
         mod_scale: float,
     ):
         if name == MODEL_NAME:
-            return SharedAttentionUniqueFFNMod(
+            return SharedAttentionModUniqueFFN(
                 config,
                 mod_dim=mod_dim,
                 mod_scale=mod_scale,
@@ -169,17 +169,20 @@ def _install_model() -> None:
         text = report_path.read_text(encoding="utf-8")
         text = text.replace(
             "# New-DT controlled all-model benchmark",
-            "# New-DT paired Shared-ATTN + unique-FFN + MOD run",
+            "# New-DT paired Shared-ATTN + Attention-MOD + unique-FFN run",
             1,
         )
         text += (
+            "\n## Attention MOD definition\n\n"
+            "The token-specific projected MOD is added to the shared attention "
+            "output at model width, before the attention residual connection. "
+            "It is not added inside the FFN. One token MOD table is shared across "
+            "all layers, and each layer has its own d_mod-to-d_model projection.\n"
             "\n## Paired-comparison guarantee\n\n"
-            "With the same seed, this model constructs the complete "
-            "Shared-ATTN + unique-FFN baseline before adding the MOD. The MOD "
-            "table starts at zero, so the baseline and MOD model have identical "
-            "base parameters and exactly identical step-zero logits. Any later "
-            "difference is therefore caused by the additional MOD path and its "
-            "optimizer state, not by a different baseline initialization.\n"
+            "With the same seed, this model constructs the complete Shared-ATTN "
+            "+ unique-FFN baseline before adding the Attention MOD. The MOD table "
+            "starts at zero, so baseline parameters, step-zero logits, and "
+            "step-zero loss are exactly identical.\n"
         )
         report_path.write_text(text, encoding="utf-8")
 
@@ -190,6 +193,29 @@ def _install_model() -> None:
     base._write_final_reports = write_final_reports  # type: ignore[assignment]
 
 
+def _translate_attention_mod_flags(arguments: list[str]) -> list[str]:
+    translated: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--attn-mod-dim":
+            translated.append("--ffn-mod-dim")
+        elif argument.startswith("--attn-mod-dim="):
+            translated.append(
+                "--ffn-mod-dim=" + argument.split("=", 1)[1]
+            )
+        elif argument == "--attn-mod-scale":
+            translated.append("--ffn-mod-scale")
+        elif argument.startswith("--attn-mod-scale="):
+            translated.append(
+                "--ffn-mod-scale=" + argument.split("=", 1)[1]
+            )
+        else:
+            translated.append(argument)
+        index += 1
+    return translated
+
+
 def main(argv: list[str] | None = None) -> int:
     _install_model()
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -198,9 +224,10 @@ def main(argv: list[str] | None = None) -> int:
         for argument in arguments
     ):
         raise SystemExit(
-            "This command always runs Shared ATTN + unique FFN + MOD; "
-            "remove --model."
+            "This command always runs Shared ATTN + token Attention MOD + "
+            "unique FFN; remove --model."
         )
+    arguments = _translate_attention_mod_flags(arguments)
     return base.main(["--model", CLI_NAME, *arguments])
 
 
