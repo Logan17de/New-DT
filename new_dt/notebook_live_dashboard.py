@@ -32,12 +32,20 @@ def _render_html(renderable: Any) -> str:
 
 
 class NotebookSafeDashboard(base.Dashboard):
-    """Keep one replaceable dashboard output in Jupyter/Colab."""
+    """Redraw one notebook output while retaining only explicit snapshots."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._notebook_mode = _notebook_display_available()
-        self._display_handle = None
+        self._snapshot_html: list[str] = []
+
+    def _redraw(self) -> None:
+        from IPython.display import HTML, clear_output, display
+
+        clear_output(wait=True)
+        display(HTML(_render_html(self.render())))
+        for snapshot in self._snapshot_html:
+            display(HTML(snapshot))
 
     def start(self) -> None:
         if self.args.no_dashboard:
@@ -45,13 +53,7 @@ class NotebookSafeDashboard(base.Dashboard):
         if not self._notebook_mode:
             super().start()
             return
-
-        from IPython.display import HTML, display
-
-        self._display_handle = display(
-            HTML(_render_html(self.render())),
-            display_id=True,
-        )
+        self._redraw()
 
     def update(self) -> None:
         if not self._notebook_mode:
@@ -59,35 +61,26 @@ class NotebookSafeDashboard(base.Dashboard):
             return
         if self.args.no_dashboard:
             return
-
-        from IPython.display import HTML
-
-        html = HTML(_render_html(self.render()))
-        if self._display_handle is None:
-            from IPython.display import display
-
-            self._display_handle = display(html, display_id=True)
-        else:
-            self._display_handle.update(html)
+        self._redraw()
 
     def snapshot(self, *, model, step: int) -> None:
         if not self._notebook_mode:
             super().snapshot(model=model, step=step)
             return
 
-        from IPython.display import HTML, display
         from rich.panel import Panel
 
         title = f"Static snapshot · {base.MODEL_LABELS[model]} · step {step:,}"
         panel = Panel(self._table(), title=title, border_style="yellow")
-        display(HTML(_render_html(panel)))
+        self._snapshot_html.append(_render_html(panel))
+        self._redraw()
 
     def stop(self) -> None:
         if not self._notebook_mode:
             super().stop()
             return
-        self.update()
-        self._display_handle = None
+        if not self.args.no_dashboard:
+            self._redraw()
 
 
 def install_notebook_safe_dashboard() -> None:
