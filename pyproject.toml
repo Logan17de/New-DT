@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "new-dt"
-version = "0.9.1"
-description = "Dynamic Transformer research models with lookup, hybrid, projected MOD, live dashboard, and SPRC backends"
+version = "0.10.0"
+description = "Dynamic Transformer research models with lookup, hybrid, projected and direct MOD, live dashboard, and SPRC backends"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.2", "numpy>=1.26", "rich>=13.7"]
@@ -20,6 +20,7 @@ new-dt-hybrid-compare = "new_dt.hybrid_training_cli:main"
 new-dt-ffn-mod = "new_dt.ffn_mod_training_cli:main"
 new-dt-all-models = "new_dt.all_models_dashboard_cli:main"
 new-dt-shared-attn-mod-unique-ffn = "new_dt.shared_attn_mod_unique_ffn_training_cli:main"
+new-dt-direct-ffn-mod-trio = "new_dt.direct_ffn_mod_variants_training_cli:main"
 new-dt-prepare-sciq = "new_dt.prepare_sciq:main"
 
 [tool.pytest.ini_options]
