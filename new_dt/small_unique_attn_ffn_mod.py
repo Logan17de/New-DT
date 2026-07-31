@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -20,115 +19,105 @@ class UniqueAttentionFFNModOutput:
     loss: Tensor | None = None
 
 
-class TokenLowRankModifier(nn.Module):
-    """Token-specific low-rank additive projection B_t(A_t x).
+class PostActivationTokenModifier(nn.Module):
+    """Project a small token-owned vector into the shared FFN activation width.
 
-    A and B are stored as sparse embedding rows, so only tokens present in the
-    current batch receive modifier gradients. B starts at zero, preserving the
-    shared projection exactly at initialization while A starts random.
+    Every token owns exactly one ``mod_dim`` vector per layer. One projection matrix
+    is shared by every token in that layer:
+
+        projected_mod(token) = P_shared @ mod[token]
+
+    Token vectors start at zero, so the modifier has exactly zero effect at model
+    initialization. The shared projection starts random and is trained jointly.
     """
 
     def __init__(
         self,
         vocab_size: int,
-        in_features: int,
+        mod_dim: int,
         out_features: int,
-        rank: int,
         *,
         init_std: float,
         scale: float,
     ) -> None:
         super().__init__()
-        if rank <= 0:
-            raise ValueError("modifier rank must be positive")
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
+        if mod_dim <= 0:
+            raise ValueError("modifier dimension must be positive")
+        self.vocab_size = int(vocab_size)
+        self.mod_dim = int(mod_dim)
+        self.out_features = int(out_features)
         self.scale = float(scale)
-        self.a = nn.Embedding(vocab_size, rank * in_features, sparse=True)
-        self.b = nn.Embedding(vocab_size, out_features * rank, sparse=True)
-        nn.init.normal_(
-            self.a.weight,
-            mean=0.0,
-            std=init_std / math.sqrt(max(in_features, 1)),
-        )
-        nn.init.zeros_(self.b.weight)
 
-    def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
-        a = self.a(token_ids).view(*token_ids.shape, self.rank, self.in_features)
-        b = self.b(token_ids).view(*token_ids.shape, self.out_features, self.rank)
-        hidden = torch.einsum("...ri,...i->...r", a, x)
-        return self.scale * torch.einsum("...or,...r->...o", b, hidden)
+        self.token_mod = nn.Embedding(vocab_size, mod_dim, sparse=True)
+        nn.init.zeros_(self.token_mod.weight)
+        self.projection = SharedLinear(
+            mod_dim,
+            out_features,
+            init_std=init_std,
+        )
+
+    def forward(self, token_ids: Tensor) -> Tensor:
+        return self.scale * self.projection(self.token_mod(token_ids))
 
     @property
     def parameters_per_token(self) -> int:
-        return self.rank * (self.in_features + self.out_features)
+        return self.mod_dim
+
+    @property
+    def shared_projection_parameters(self) -> int:
+        return self.mod_dim * self.out_features
 
 
-class SharedLinearWithTokenMod(nn.Module):
+class SharedFFNWithPostActivationTokenMod(nn.Module):
+    """Shared SwiGLU FFN with the user's token MOD after activation.
+
+    Flow:
+
+        up = W_up x
+        gate = W_gate x
+        activated = SiLU(gate) * up
+        activated = activated + P_shared(mod[token])
+        output = W_down activated
+
+    The down projection therefore performs the normal FFN shrink only after the
+    token-specific modifier has been added in FFN activation space.
+    """
+
     def __init__(
         self,
         config: DynamicTransformerConfig,
-        in_features: int,
-        out_features: int,
         *,
-        rank: int,
+        mod_dim: int,
         scale: float,
     ) -> None:
         super().__init__()
-        self.shared = SharedLinear(
-            in_features,
-            out_features,
+        self.up_proj = SharedLinear(
+            config.d_model,
+            config.ffn_dim,
             init_std=config.init_std,
         )
-        self.modifier = TokenLowRankModifier(
+        self.gate_proj = SharedLinear(
+            config.d_model,
+            config.ffn_dim,
+            init_std=config.init_std,
+        )
+        self.modifier = PostActivationTokenModifier(
             config.vocab_size,
-            in_features,
-            out_features,
-            rank,
+            mod_dim,
+            config.ffn_dim,
             init_std=config.init_std,
             scale=scale,
         )
-
-    def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
-        return self.shared(x) + self.modifier(x, token_ids)
-
-
-class SharedFFNWithTokenMod(nn.Module):
-    def __init__(
-        self,
-        config: DynamicTransformerConfig,
-        *,
-        rank: int,
-        scale: float,
-    ) -> None:
-        super().__init__()
-        self.up_proj = SharedLinearWithTokenMod(
-            config,
-            config.d_model,
-            config.ffn_dim,
-            rank=rank,
-            scale=scale,
-        )
-        self.gate_proj = SharedLinearWithTokenMod(
-            config,
-            config.d_model,
-            config.ffn_dim,
-            rank=rank,
-            scale=scale,
-        )
-        self.down_proj = SharedLinearWithTokenMod(
-            config,
+        self.down_proj = SharedLinear(
             config.ffn_dim,
             config.d_model,
-            rank=rank,
-            scale=scale,
+            init_std=config.init_std,
         )
 
     def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
-        up = self.up_proj(x, token_ids)
-        gate = self.gate_proj(x, token_ids)
-        return self.down_proj(F.silu(gate) * up, token_ids)
+        activated = F.silu(self.gate_proj(x)) * self.up_proj(x)
+        activated = activated + self.modifier(token_ids)
+        return self.down_proj(activated)
 
 
 class UniqueAttentionFFNModBlock(nn.Module):
@@ -136,16 +125,16 @@ class UniqueAttentionFFNModBlock(nn.Module):
         self,
         config: DynamicTransformerConfig,
         *,
-        mod_rank: int,
+        mod_dim: int,
         mod_scale: float,
     ) -> None:
         super().__init__()
         self.attention_norm = SharedRMSNorm(config.d_model)
         self.attention = LookupSelfAttention(config)
         self.ffn_norm = SharedRMSNorm(config.d_model)
-        self.ffn = SharedFFNWithTokenMod(
+        self.ffn = SharedFFNWithPostActivationTokenMod(
             config,
-            rank=mod_rank,
+            mod_dim=mod_dim,
             scale=mod_scale,
         )
         self.dropout = nn.Dropout(config.dropout)
@@ -156,22 +145,23 @@ class UniqueAttentionFFNModBlock(nn.Module):
 
 
 class UniqueAttentionSharedFFNMod(nn.Module):
-    """Unique token attention plus shared FFN with small token low-rank MODs."""
+    """Unique attention plus shared FFN with projected post-activation token MOD."""
 
     def __init__(
         self,
         config: DynamicTransformerConfig,
         *,
-        mod_rank: int = 4,
+        mod_dim: int = 4,
         mod_scale: float = 1.0,
     ) -> None:
         super().__init__()
         config.validate()
-        if mod_rank <= 0:
-            raise ValueError("mod_rank must be positive")
+        if mod_dim <= 0:
+            raise ValueError("mod_dim must be positive")
         self.config = config
-        self.mod_rank = int(mod_rank)
+        self.mod_dim = int(mod_dim)
         self.mod_scale = float(mod_scale)
+
         self.embedding = nn.Embedding(
             config.vocab_size,
             config.d_model,
@@ -181,7 +171,7 @@ class UniqueAttentionSharedFFNMod(nn.Module):
         self.layers = nn.ModuleList(
             UniqueAttentionFFNModBlock(
                 config,
-                mod_rank=self.mod_rank,
+                mod_dim=self.mod_dim,
                 mod_scale=self.mod_scale,
             )
             for _ in range(config.n_layers)
@@ -202,9 +192,8 @@ class UniqueAttentionSharedFFNMod(nn.Module):
         for module in self.modules():
             if isinstance(module, TokenLookupLinear):
                 yield module.lookup.weight
-            elif isinstance(module, TokenLowRankModifier):
-                yield module.a.weight
-                yield module.b.weight
+            elif isinstance(module, PostActivationTokenModifier):
+                yield module.token_mod.weight
 
     def dense_parameters(self) -> Iterator[nn.Parameter]:
         sparse_ids = {id(parameter) for parameter in self.sparse_parameters()}
@@ -216,15 +205,14 @@ class UniqueAttentionSharedFFNMod(nn.Module):
         sparse = list(self.sparse_parameters())
         dense = list(self.dense_parameters())
         attention_per_token = 4 * self.config.d_model * self.config.d_model
-        mod_per_token = 3 * self.mod_rank * (
-            self.config.d_model + self.config.ffn_dim
-        )
+        mod_projection_per_layer = self.mod_dim * self.config.ffn_dim
         return {
-            "architecture": "unique_attn_shared_ffn_mod",
-            "mod_rank": self.mod_rank,
+            "architecture": "unique_attn_shared_ffn_post_activation_mod",
+            "mod_dim": self.mod_dim,
             "mod_scale": self.mod_scale,
             "unique_attention_parameters_per_token_per_layer": attention_per_token,
-            "ffn_mod_parameters_per_token_per_layer": mod_per_token,
+            "ffn_mod_parameters_per_token_per_layer": self.mod_dim,
+            "ffn_mod_projection_parameters_per_layer": mod_projection_per_layer,
             "lookup_parameters": int(sum(p.numel() for p in sparse)),
             "dense_parameters": int(sum(p.numel() for p in dense)),
             "lookup_parameter_bytes": int(
