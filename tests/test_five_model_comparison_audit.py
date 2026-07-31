@@ -84,7 +84,7 @@ def test_existing_mod_has_one_table_and_one_projection_per_layer() -> None:
 
 def test_batch_plan_is_deterministic_and_reusable() -> None:
     tokenizer = WordSpaceTokenizer(
-        tokens=["<pad>", "<bos>", "<eos>", "<unk>", "a", "b"],
+        tokens=["<pad>", "<unk>", "<bos>", "<eos>", "a", "b"],
         lowercase=False,
     )
     corpus = CorpusBundle(
